@@ -125,7 +125,7 @@ async fn kill_process_tree(
             }
             // 2. Await process exit within grace duration
             match tokio::time::timeout(grace, child.wait()).await {
-                Ok(Ok(_)) => return,
+                Ok(Ok(_)) => (),
                 _ => {
                     // 3. Fallback: forcefully send SIGKILL to the process group
                     unsafe {
