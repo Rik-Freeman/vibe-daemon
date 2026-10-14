@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "vibe-daemon": {
+      "command": "vibe-daemon",
+      "args": [
+        "--log-level",
+        "info"
+      ],
+      "env": {
+        "RUST_LOG": "info"
+      }
+    }
+  }
+}

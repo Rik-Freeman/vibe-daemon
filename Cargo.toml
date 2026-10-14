@@ -1,0 +1,31 @@
+[package]
+name = "vibe-daemon"
+version = "0.1.0"
+edition = "2024"
+authors = ["vibe-daemon contributors"]
+description = "Secure Model Context Protocol (MCP) server for safe AI-driven DevOps and system administration"
+readme = "README.md"
+repository = "https://github.com/vibe-daemon/vibe-daemon"
+license = "MIT"
+keywords = ["mcp", "ai", "devops", "rust", "security"]
+categories = ["development-tools", "os"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+toml = "0.8"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+async-trait = "0.1"
+axum = "0.8"
+tokio-stream = { version = "0.1", features = ["sync"] }
+tower = { version = "0.5", features = ["util"] }
+sha2 = "0.10"
+regex = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

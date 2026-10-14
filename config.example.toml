@@ -1,0 +1,88 @@
+# vibe-daemon configuration file
+# All sections and fields are optional; safe defaults are used if omitted.
+
+[daemon]
+# Logging level: trace, debug, info, warn, error
+log_level = "info"
+
+# Default command execution timeout in seconds
+default_command_timeout_secs = 30
+
+# Maximum stdout/stderr bytes kept in memory before discarding excess stream bytes (default: 1048576 = 1 MB)
+max_stdout_bytes = 1048576
+max_stderr_bytes = 1048576
+
+# Grace period in milliseconds for graceful process termination before forced SIGKILL (default: 2000 ms)
+termination_grace_ms = 2000
+
+# Optional path to JSONL audit log file (can also be specified in [audit])
+# audit_log_path = "/var/log/vibe-daemon/audit.jsonl"
+
+[audit]
+# Optional path to JSONL audit log file recording all MCP tool executions
+# log_path = "/var/log/vibe-daemon/audit.jsonl"
+
+[security]
+# Ports that cannot be closed or blocked by AI commands
+protected_ports = [22]
+
+# Critical system services that cannot be stopped, killed, or disabled
+protected_services = [
+    "vibe-daemon",
+    "sshd",
+    "ssh",
+    "NetworkManager",
+    "systemd-networkd",
+    "networking",
+    "systemd-resolved"
+]
+
+# Maximum total tool calls per minute allowed (default: 60, 0 = unlimited)
+max_calls_per_minute = 60
+
+# Optional per-tool invocation limits per minute
+# [security.tool_limits]
+# execute_safe_command = 10
+
+# Optional custom paths protected from file write operations
+# protected_write_paths = ["/var/data/critical", "/srv/production"]
+
+# Optional Bearer auth token required for remote HTTP and SSE network requests
+# If omitted or empty, authentication is not enforced.
+# auth_token = "your-secret-bearer-token"
+
+[inspector]
+# Allowed directories for safe configuration reading and writing (path traversal protection)
+allowed_config_dirs = [
+    "/etc/nginx",
+    "/etc/caddy",
+    "/etc/supervisor",
+    "/etc/haproxy",
+    "/etc/letsencrypt"
+]
+
+# Key system services actively tracked by the system inspector
+key_services = [
+    "nginx",
+    "sshd",
+    "docker",
+    "postgresql"
+]
+
+[tasks]
+# Maximum concurrent active background tasks allowed (default: 8)
+max_active_tasks = 8
+
+# Maximum total background tasks retained in memory history (default: 100)
+max_retained_tasks = 100
+
+# Maximum in-memory log buffer per background task in bytes (default: 5242880 = 5 MB)
+output_limit_bytes = 5242880
+
+# Time-to-live in seconds for completed tasks before automatic cleanup (default: 3600 = 1 hour)
+completed_ttl_secs = 3600
+
+# Grace period in seconds for soft process termination before SIGKILL (default: 3)
+termination_grace_secs = 3
+
+
