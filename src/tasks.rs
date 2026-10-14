@@ -146,10 +146,18 @@ async fn kill_process_tree(
         let _ = grace;
         if let Some(pid) = pid_opt {
             // taskkill /PID <pid> /T /F terminates process and all its child processes
-            let _ = tokio::process::Command::new("taskkill")
-                .args(["/PID", &pid.to_string(), "/T", "/F"])
-                .output()
-                .await;
+            let mut kill_cmd = tokio::process::Command::new("taskkill");
+            kill_cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
+            kill_cmd.stdout(std::process::Stdio::null());
+            kill_cmd.stderr(std::process::Stdio::null());
+
+            // Await taskkill with a strict timeout to prevent blocking the async runtime
+            let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+                if let Ok(mut kill_child) = kill_cmd.spawn() {
+                    let _ = kill_child.wait().await;
+                }
+            })
+            .await;
         }
         let _ = child.kill().await;
         let _ = child.wait().await;

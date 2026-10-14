@@ -115,25 +115,27 @@ async fn read_stream_bounded<R: tokio::io::AsyncRead + Unpin>(
 async fn terminate_process(mut child: tokio::process::Child, grace: Duration) -> Option<i32> {
     let pid = child.id();
 
-    // On Unix: soft termination (SIGTERM), wait grace, fallback to forced SIGKILL, then wait()
+    // On Unix: soft termination (SIGTERM) to process group (-pgid), wait grace, fallback to forced SIGKILL, then wait()
     #[cfg(unix)]
     {
         if let Some(pid_val) = pid {
+            let pgid = pid_val as libc::pid_t;
             unsafe {
-                libc::kill(pid_val as libc::pid_t, libc::SIGTERM);
+                libc::kill(-pgid, libc::SIGTERM);
             }
-        }
-        match tokio::time::timeout(grace, child.wait()).await {
-            Ok(Ok(status)) => status.code(),
-            _ => {
-                if let Some(pid_val) = pid {
+            match tokio::time::timeout(grace, child.wait()).await {
+                Ok(Ok(status)) => status.code(),
+                _ => {
                     unsafe {
-                        libc::kill(pid_val as libc::pid_t, libc::SIGKILL);
+                        libc::kill(-pgid, libc::SIGKILL);
                     }
+                    let _ = child.kill().await;
+                    child.wait().await.ok().and_then(|s| s.code())
                 }
-                let _ = child.kill().await;
-                child.wait().await.ok().and_then(|s| s.code())
             }
+        } else {
+            let _ = child.kill().await;
+            child.wait().await.ok().and_then(|s| s.code())
         }
     }
 
@@ -142,10 +144,18 @@ async fn terminate_process(mut child: tokio::process::Child, grace: Duration) ->
     {
         let _ = grace; // used on Unix for SIGTERM grace
         if let Some(pid_val) = pid {
-            let _ = tokio::process::Command::new("taskkill")
-                .args(["/PID", &pid_val.to_string(), "/T", "/F"])
-                .output()
-                .await;
+            let mut kill_cmd = tokio::process::Command::new("taskkill");
+            kill_cmd.args(["/PID", &pid_val.to_string(), "/T", "/F"]);
+            kill_cmd.stdout(std::process::Stdio::null());
+            kill_cmd.stderr(std::process::Stdio::null());
+
+            // Await taskkill with a strict timeout to prevent blocking the async runtime
+            let _ = tokio::time::timeout(Duration::from_millis(1500), async {
+                if let Ok(mut kill_child) = kill_cmd.spawn() {
+                    let _ = kill_child.wait().await;
+                }
+            })
+            .await;
         }
         let _ = child.kill().await;
         child.wait().await.ok().and_then(|s| s.code())
@@ -158,6 +168,11 @@ pub async fn execute_process_bounded(
     mut process_cmd: tokio::process::Command,
     limits: &CommandLimits,
 ) -> Result<CommandOutcome, String> {
+    #[cfg(unix)]
+    {
+        process_cmd.process_group(0);
+    }
+
     process_cmd.stdout(std::process::Stdio::piped());
     process_cmd.stderr(std::process::Stdio::piped());
 
