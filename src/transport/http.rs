@@ -20,6 +20,12 @@ use crate::transport::TransportType;
 
 static SESSION_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Clone)]
+pub struct SessionEntry {
+    sender: tokio::sync::mpsc::Sender<String>,
+    client_identity: String,
+}
+
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -32,7 +38,7 @@ impl Drop for AbortOnDrop {
 #[derive(Clone)]
 pub struct HttpTransportState {
     pub dispatcher: McpDispatcher,
-    pub sessions: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    pub sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
     _forwarder: Arc<AbortOnDrop>,
 }
 
@@ -52,7 +58,7 @@ impl HttpTransportState {
 /// Enforces per-session resource subscription routing and non-blocking delivery.
 fn start_sse_event_forwarder(
     dispatcher: &McpDispatcher,
-    sessions: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
 ) -> tokio::task::JoinHandle<()> {
     let mut event_rx = dispatcher.event_bus.subscribe();
     let sub_manager = dispatcher.subscription_manager.clone();
@@ -76,9 +82,9 @@ fn start_sse_event_forwarder(
                         if sid == "stdio" {
                             continue;
                         }
-                        if let Some(tx) = sessions_guard.get(&sid)
+                        if let Some(session) = sessions_guard.get(&sid)
                             && let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-                                tx.try_send(serialized.clone())
+                                session.sender.try_send(serialized.clone())
                         {
                             bus.record_dropped();
                             warn!(session = %sid, "SSE event dropped: client buffer full");
@@ -92,9 +98,9 @@ fn start_sse_event_forwarder(
                     };
 
                     let sessions_guard = sessions.read().await;
-                    for (sid, tx) in sessions_guard.iter() {
+                    for (sid, session) in sessions_guard.iter() {
                         if let Err(tokio::sync::mpsc::error::TrySendError::Full(_)) =
-                            tx.try_send(serialized.clone())
+                            session.sender.try_send(serialized.clone())
                         {
                             bus.record_dropped();
                             warn!(session = %sid, "SSE event dropped: client buffer full");
@@ -202,28 +208,44 @@ pub async fn handle_post_message(
         }
     };
 
-    // Record client info if available
-    if let Some(user_agent) = headers.get("user-agent").and_then(|u| u.to_str().ok())
-        && let Ok(mut lock) = state.dispatcher.connected_client.write()
-    {
-        *lock = Some(user_agent.to_string());
-    }
-
     // 3. Process request through MCP Dispatcher
     let session_id_opt = query.get("sessionId").map(|s| s.as_str());
+    let client_identity = headers
+        .get("user-agent")
+        .and_then(|u| u.to_str().ok())
+        .unwrap_or("http-client");
+    if let Some(session_id) = session_id_opt {
+        let sessions = state.sessions.read().await;
+        let Some(session) = sessions.get(session_id) else {
+            warn!(session = %session_id, "Request rejected for unknown or disconnected SSE session");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": request.id,
+                    "error": { "code": -32602, "message": "Unknown or disconnected sessionId" }
+                })),
+            )
+                .into_response();
+        };
+        if session.client_identity != client_identity {
+            warn!(session = %session_id, "Request rejected because session identity does not match");
+            return unauthorized_response();
+        }
+    }
     let response_opt = state
         .dispatcher
-        .handle_request_with_session(request, session_id_opt)
+        .handle_request_with_context(request, session_id_opt, Some(client_identity))
         .await;
 
     // 4. If request is associated with an active SSE session, broadcast message to the stream
     if let Some(session_id) = query.get("sessionId") {
         let sessions = state.sessions.read().await;
-        if let Some(tx) = sessions.get(session_id)
+        if let Some(session) = sessions.get(session_id)
             && let Some(ref resp) = response_opt
             && let Ok(serialized) = serde_json::to_string(resp)
         {
-            let _ = tx.send(serialized).await;
+            let _ = session.sender.send(serialized).await;
         }
     }
 
@@ -237,7 +259,7 @@ pub async fn handle_post_message(
 /// RAII Guard for cleaning up sessions and resource subscriptions when an SSE stream disconnects.
 struct SessionGuard {
     session_id: String,
-    sessions: Arc<RwLock<HashMap<String, tokio::sync::mpsc::Sender<String>>>>,
+    sessions: Arc<RwLock<HashMap<String, SessionEntry>>>,
     subscription_manager: Arc<crate::resources::SubscriptionManager>,
 }
 
@@ -278,11 +300,22 @@ pub async fn handle_sse(
     info!(session = %session_id, "New SSE client connected");
 
     let (tx, rx) = tokio::sync::mpsc::channel::<String>(128);
+    let client_identity = headers
+        .get("user-agent")
+        .and_then(|u| u.to_str().ok())
+        .unwrap_or("http-client")
+        .to_string();
 
     // Register active session
     {
         let mut sessions = state.sessions.write().await;
-        sessions.insert(session_id.clone(), tx);
+        sessions.insert(
+            session_id.clone(),
+            SessionEntry {
+                sender: tx,
+                client_identity,
+            },
+        );
     }
 
     // 2. Initial event notifying client of message posting endpoint (MCP SSE Spec)
@@ -332,6 +365,7 @@ pub async fn run_http(
     port: u16,
     transport_type: TransportType,
 ) -> anyhow::Result<()> {
+    validate_remote_bind_security(host, &dispatcher.config.security).map_err(anyhow::Error::msg)?;
     let state = HttpTransportState::new(dispatcher);
     let app = create_http_router(state.clone());
     let addr = format!("{host}:{port}");
@@ -344,8 +378,35 @@ pub async fn run_http(
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     let serve_res = axum::serve(listener, app).await;
-    state.dispatcher.audit_logger.flush().await;
+    if let Err(e) = state.dispatcher.audit_logger.flush().await {
+        tracing::warn!(error = %e, "Failed to flush audit logger after HTTP server shutdown");
+    }
     serve_res?;
+    Ok(())
+}
+
+/// Remote listeners must never become unauthenticated through an omitted token.
+pub fn validate_remote_bind_security(
+    host: &str,
+    security: &crate::config::SecurityConfig,
+) -> Result<(), String> {
+    let is_loopback = if host.eq_ignore_ascii_case("localhost") {
+        true
+    } else {
+        host.parse::<std::net::IpAddr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+    };
+    let has_token = security
+        .auth_token
+        .as_deref()
+        .is_some_and(|token| !token.trim().is_empty());
+
+    if !is_loopback && !has_token {
+        return Err(format!(
+            "Refusing to bind remote transport to '{host}' without a non-empty security.auth_token"
+        ));
+    }
     Ok(())
 }
 
@@ -513,6 +574,75 @@ mod tests {
         assert_eq!(auth_res.status(), StatusCode::OK);
     }
 
+    #[test]
+    fn test_remote_bind_requires_authentication() {
+        let mut security = crate::config::SecurityConfig::default();
+        assert!(validate_remote_bind_security("127.0.0.1", &security).is_ok());
+        assert!(validate_remote_bind_security("::1", &security).is_ok());
+        assert!(validate_remote_bind_security("0.0.0.0", &security).is_err());
+
+        security.auth_token = Some("strong-test-token".to_string());
+        assert!(validate_remote_bind_security("0.0.0.0", &security).is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_unknown_sse_session_is_rejected() {
+        let dispatcher = McpDispatcher::new();
+        let state = HttpTransportState::new(dispatcher);
+        let app = create_http_router(state);
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/list"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message?sessionId=forged-session")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_sse_session_identity_mismatch_is_rejected() {
+        let dispatcher = McpDispatcher::new();
+        let state = HttpTransportState::new(dispatcher);
+        let (tx, _rx) = tokio::sync::mpsc::channel(4);
+        state.sessions.write().await.insert(
+            "owned-session".to_string(),
+            SessionEntry {
+                sender: tx,
+                client_identity: "owner-agent".to_string(),
+            },
+        );
+        let app = create_http_router(state);
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/list"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/message?sessionId=owned-session")
+                    .header("user-agent", "different-agent")
+                    .header("content-type", "application/json")
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
     #[tokio::test]
     async fn test_sse_endpoint_establishes_connection() {
         let dispatcher = McpDispatcher::new();
@@ -554,8 +684,20 @@ mod tests {
         // Register active sessions
         {
             let mut sessions = state.sessions.write().await;
-            sessions.insert(sid1.to_string(), tx1);
-            sessions.insert(sid2.to_string(), tx2);
+            sessions.insert(
+                sid1.to_string(),
+                SessionEntry {
+                    sender: tx1,
+                    client_identity: "test-client-1".to_string(),
+                },
+            );
+            sessions.insert(
+                sid2.to_string(),
+                SessionEntry {
+                    sender: tx2,
+                    client_identity: "test-client-2".to_string(),
+                },
+            );
         }
 
         // Session 1 subscribes to system://status

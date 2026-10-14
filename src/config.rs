@@ -11,6 +11,7 @@ use tracing::{info, warn};
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Logging verbosity level (trace, debug, info, warn, error).
     #[serde(default = "default_log_level")]
@@ -93,6 +94,7 @@ impl DaemonConfig {
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct SecurityConfig {
     /// Ports that cannot be closed or blocked by AI commands (e.g. 22 for SSH).
     #[serde(default = "default_protected_ports")]
@@ -185,6 +187,7 @@ impl SecurityConfig {
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct InspectorConfig {
     /// Allowed base directories for safe configuration file reading.
     #[serde(default = "default_allowed_config_dirs")]
@@ -239,6 +242,7 @@ impl Default for InspectorConfig {
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TasksConfig {
     /// Maximum concurrent active background tasks allowed (default: 8).
     #[serde(default = "default_max_active_tasks")]
@@ -298,6 +302,7 @@ impl Default for TasksConfig {
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct AuditConfig {
     /// Optional path to structured JSONL audit log file.
     #[serde(default)]
@@ -373,6 +378,7 @@ impl std::error::Error for ConfigError {
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub daemon: DaemonConfig,
@@ -487,6 +493,16 @@ impl Config {
                     "Duplicate service '{trimmed}' found in security.protected_services"
                 )));
             }
+        }
+        if self
+            .security
+            .auth_token
+            .as_deref()
+            .is_some_and(|token| token.trim().is_empty())
+        {
+            return Err(ConfigError::Validation(
+                "security.auth_token cannot be empty when specified".to_string(),
+            ));
         }
 
         // 3. Daemon bounds
@@ -958,5 +974,12 @@ max_active_tasks = 10
 max_retained_tasks = 5
 "#;
         assert!(Config::from_toml_str(invalid_retained).is_err());
+    }
+
+    #[test]
+    fn test_unknown_fields_and_empty_auth_token_fail_closed() {
+        assert!(Config::from_toml_str("[daemon]\nunknown_limit = 1").is_err());
+        assert!(Config::from_toml_str("unknown_section = 1").is_err());
+        assert!(Config::from_toml_str("[security]\nauth_token = '   '").is_err());
     }
 }

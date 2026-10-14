@@ -26,6 +26,21 @@ pub enum ServerEvent {
 }
 
 impl ServerEvent {
+    /// Stable severity classification included in every outbound notification.
+    pub fn severity(&self) -> &'static str {
+        match self {
+            Self::TaskCompleted { status, .. } => match status {
+                TaskStatus::Success => "info",
+                TaskStatus::Running | TaskStatus::Cancelling => "notice",
+                TaskStatus::Failed | TaskStatus::Cancelled => "warning",
+            },
+            Self::ResourceUpdated { .. } => "info",
+            Self::MemoryThresholdExceeded { .. }
+            | Self::ServiceDown { .. }
+            | Self::CertificateExpiring { .. } => "warning",
+        }
+    }
+
     /// Deterministic deduplication key for throttling repeated events.
     pub fn deduplication_key(&self) -> String {
         match self {
@@ -51,30 +66,40 @@ impl ServerEvent {
 
     /// Converts a internal ServerEvent into a standard JSON-RPC 2.0 notification (without an id).
     pub fn to_jsonrpc_notification(&self) -> JsonRpcNotification {
+        let occurred_at = chrono::Utc::now().to_rfc3339();
+        let severity = self.severity();
         match self {
             Self::TaskCompleted { task_id, status } => JsonRpcNotification::new(
                 "notifications/tasks/completed",
                 Some(serde_json::json!({
                     "taskId": task_id,
                     "status": status,
+                    "severity": severity,
+                    "occurredAt": occurred_at,
                 })),
             ),
             Self::ResourceUpdated { uri } => JsonRpcNotification::new(
                 "notifications/resources/updated",
                 Some(serde_json::json!({
                     "uri": uri,
+                    "severity": severity,
+                    "occurredAt": occurred_at,
                 })),
             ),
             Self::MemoryThresholdExceeded { percent } => JsonRpcNotification::new(
                 "notifications/system/memory_threshold",
                 Some(serde_json::json!({
                     "percent": percent,
+                    "severity": severity,
+                    "occurredAt": occurred_at,
                 })),
             ),
             Self::ServiceDown { service } => JsonRpcNotification::new(
                 "notifications/services/down",
                 Some(serde_json::json!({
                     "service": service,
+                    "severity": severity,
+                    "occurredAt": occurred_at,
                 })),
             ),
             Self::CertificateExpiring { domain, days } => JsonRpcNotification::new(
@@ -82,6 +107,8 @@ impl ServerEvent {
                 Some(serde_json::json!({
                     "domain": domain,
                     "days": days,
+                    "severity": severity,
+                    "occurredAt": occurred_at,
                 })),
             ),
         }
@@ -252,6 +279,8 @@ mod tests {
         assert_eq!(val["method"], "notifications/tasks/completed");
         assert_eq!(val["params"]["taskId"], "task-123");
         assert_eq!(val["params"]["status"], "Success");
+        assert_eq!(val["params"]["severity"], "info");
+        assert!(val["params"]["occurredAt"].as_str().is_some());
     }
 
     #[tokio::test]

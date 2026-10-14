@@ -416,8 +416,11 @@ pub fn verify_audit_log_file_sync(
 // -----------------------------------------------------------------------------
 
 enum AuditMessage {
-    Record(Box<AuditRecord>),
-    Flush(tokio::sync::oneshot::Sender<()>),
+    Record(
+        Box<AuditRecord>,
+        Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
+    ),
+    Flush(tokio::sync::oneshot::Sender<Result<(), String>>),
 }
 
 /// Audit logger that writes tamper-evident, secret-redacted JSONL records
@@ -444,107 +447,157 @@ impl std::fmt::Debug for AuditLogger {
 
 impl AuditLogger {
     /// Create an AuditLogger with an optional target file path and default queue capacity.
-    pub fn new(log_path: Option<PathBuf>) -> Self {
+    /// Returns an error if the existing log fails integrity verification (fail-closed).
+    pub fn new(log_path: Option<PathBuf>) -> Result<Self, AuditIntegrityError> {
         Self::with_capacity(log_path, DEFAULT_AUDIT_CHANNEL_CAPACITY)
     }
 
     /// Create an AuditLogger with a custom bounded channel capacity.
-    pub fn with_capacity(log_path: Option<PathBuf>, capacity: usize) -> Self {
+    /// Returns an error if the existing log fails integrity verification (fail-closed).
+    pub fn with_capacity(
+        log_path: Option<PathBuf>,
+        capacity: usize,
+    ) -> Result<Self, AuditIntegrityError> {
         let Some(path) = log_path else {
-            return Self {
+            return Ok(Self {
                 tx: None,
                 log_path: None,
                 dropped_count: Arc::new(AtomicU64::new(0)),
-            };
+            });
         };
 
-        // 1. Verify existing log file and determine starting sequence and previous_hash
-        let (initial_seq, initial_hash) = match verify_audit_log_file_sync(&path) {
-            Ok(report) => {
-                if report.total_records > 0 {
-                    info!(
-                        path = %path.display(),
-                        records = report.total_records,
-                        last_seq = report.last_sequence,
-                        "Audit log integrity verified on startup"
-                    );
-                }
-                (report.last_sequence, report.last_hash)
-            }
-            Err(err) => {
-                error!(
-                    path = %path.display(),
-                    error = %err,
-                    "CRITICAL: Existing audit log failed integrity verification upon startup!"
-                );
-                (0, GENESIS_HASH.to_string())
-            }
-        };
+        // 1. Verify existing log file and determine starting sequence and previous_hash (fail-closed)
+        let report = verify_audit_log_file_sync(&path).map_err(|err| {
+            error!(
+                path = %path.display(),
+                error = %err,
+                "CRITICAL: Existing audit log failed integrity verification upon startup! Failing closed."
+            );
+            err
+        })?;
+
+        if report.total_records > 0 {
+            info!(
+                path = %path.display(),
+                records = report.total_records,
+                last_seq = report.last_sequence,
+                "Audit log integrity verified on startup"
+            );
+        }
+        let initial_seq = report.last_sequence;
+        let initial_hash = report.last_hash;
 
         let path_arc = Arc::new(path);
         let path_clone = path_arc.clone();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<AuditMessage>(capacity);
         let dropped_count = Arc::new(AtomicU64::new(0));
+        let actor_dropped_count = dropped_count.clone();
 
         tokio::spawn(async move {
             let mut current_seq = initial_seq;
             let mut current_hash = initial_hash;
             let mut file_opt: Option<tokio::fs::File> = None;
+            let mut poisoned: Option<String> = None;
 
             while let Some(msg) = rx.recv().await {
                 match msg {
-                    AuditMessage::Record(mut record) => {
-                        current_seq += 1;
-                        record.sequence = current_seq;
-                        record.previous_hash = current_hash.clone();
-                        record.arguments = redact_value(&record.arguments);
-                        record.record_hash = record.compute_hash();
-                        current_hash = record.record_hash.clone();
-
-                        let mut json = match serde_json::to_string(&record) {
-                            Ok(j) => j,
-                            Err(e) => {
-                                error!(error = %e, "Failed to serialize audit record");
-                                continue;
+                    AuditMessage::Record(mut record, ack_opt) => {
+                        if let Some(reason) = poisoned.as_ref() {
+                            let err = Err(format!(
+                                "Audit logger is fail-closed after a previous persistence failure: {reason}"
+                            ));
+                            if let Some(ack) = ack_opt {
+                                let _ = ack.send(err);
+                            } else {
+                                actor_dropped_count.fetch_add(1, Ordering::Relaxed);
                             }
-                        };
-                        json.push('\n');
-
-                        if file_opt.is_none() {
-                            if let Some(parent) = path_clone.parent()
-                                && !parent.as_os_str().is_empty()
-                                && !parent.exists()
-                            {
-                                let _ = tokio::fs::create_dir_all(parent).await;
-                            }
-                            match tokio::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(&*path_clone)
-                                .await
-                            {
-                                Ok(f) => file_opt = Some(f),
-                                Err(e) => {
-                                    error!(path = %path_clone.display(), error = %e, "Failed to open audit log file");
-                                    continue;
-                                }
-                            }
+                            continue;
                         }
 
-                        if let Some(ref mut file) = file_opt {
-                            if let Err(e) = file.write_all(json.as_bytes()).await {
-                                error!(path = %path_clone.display(), error = %e, "Failed to write audit record");
-                            } else {
-                                let _ = file.flush().await;
+                        let next_seq = current_seq + 1;
+                        let prev_hash = current_hash.clone();
+                        record.sequence = next_seq;
+                        record.previous_hash = prev_hash;
+                        record.arguments = redact_value(&record.arguments);
+                        record.record_hash = record.compute_hash();
+
+                        let write_res: Result<(), String> = match serde_json::to_string(&record) {
+                            Ok(mut json) => {
+                                json.push('\n');
+                                if file_opt.is_none() {
+                                    if let Some(parent) = path_clone.parent()
+                                        && !parent.as_os_str().is_empty()
+                                        && !parent.exists()
+                                    {
+                                        let _ = tokio::fs::create_dir_all(parent).await;
+                                    }
+                                    match tokio::fs::OpenOptions::new()
+                                        .create(true)
+                                        .append(true)
+                                        .open(&*path_clone)
+                                        .await
+                                    {
+                                        Ok(f) => file_opt = Some(f),
+                                        Err(e) => {
+                                            error!(path = %path_clone.display(), error = %e, "Failed to open audit log file");
+                                        }
+                                    }
+                                }
+
+                                if let Some(ref mut file) = file_opt {
+                                    if let Err(e) = file.write_all(json.as_bytes()).await {
+                                        error!(path = %path_clone.display(), error = %e, "Failed to write audit record");
+                                        Err(format!("Failed to write audit record: {e}"))
+                                    } else if let Err(e) = file.flush().await {
+                                        error!(path = %path_clone.display(), error = %e, "Failed to flush audit record");
+                                        Err(format!("Failed to flush audit record: {e}"))
+                                    } else if let Err(e) = file.sync_data().await {
+                                        error!(path = %path_clone.display(), error = %e, "Failed to sync audit record to disk");
+                                        Err(format!("Failed to sync audit record to disk: {e}"))
+                                    } else {
+                                        Ok(())
+                                    }
+                                } else {
+                                    Err("Audit log file handle is not available".to_string())
+                                }
                             }
+                            Err(e) => {
+                                error!(error = %e, "Failed to serialize audit record");
+                                Err(format!("Failed to serialize audit record: {e}"))
+                            }
+                        };
+
+                        if write_res.is_ok() {
+                            current_seq = next_seq;
+                            current_hash = record.record_hash;
+                        } else if let Err(reason) = &write_res {
+                            // A failed/partial append makes further chaining unsafe. Never
+                            // continue from an in-memory state that may differ from disk.
+                            poisoned = Some(reason.clone());
+                            file_opt = None;
+                        }
+
+                        if let Some(ack) = ack_opt {
+                            let _ = ack.send(write_res);
+                        } else if write_res.is_err() {
+                            actor_dropped_count.fetch_add(1, Ordering::Relaxed);
                         }
                     }
                     AuditMessage::Flush(ack) => {
-                        if let Some(ref mut file) = file_opt {
-                            let _ = file.flush().await;
-                            let _ = file.sync_data().await;
-                        }
-                        let _ = ack.send(());
+                        let res = if let Some(reason) = poisoned.as_ref() {
+                            Err(format!("Audit logger is fail-closed: {reason}"))
+                        } else if let Some(ref mut file) = file_opt {
+                            if let Err(e) = file.flush().await {
+                                Err(format!("Flush error: {e}"))
+                            } else if let Err(e) = file.sync_data().await {
+                                Err(format!("sync_data error: {e}"))
+                            } else {
+                                Ok(())
+                            }
+                        } else {
+                            Ok(())
+                        };
+                        let _ = ack.send(res);
                     }
                 }
             }
@@ -556,11 +609,11 @@ impl AuditLogger {
             }
         });
 
-        Self {
+        Ok(Self {
             tx: Some(tx),
             log_path: Some(path_arc),
             dropped_count,
-        }
+        })
     }
 
     /// Check if audit logging is enabled.
@@ -583,7 +636,7 @@ impl AuditLogger {
     pub fn log_async(&self, mut record: AuditRecord) {
         if let Some(ref tx) = self.tx {
             record.arguments = redact_value(&record.arguments);
-            let msg = AuditMessage::Record(Box::new(record));
+            let msg = AuditMessage::Record(Box::new(record), None);
 
             if let Err(tokio::sync::mpsc::error::TrySendError::Full(overflow_msg)) =
                 tx.try_send(msg)
@@ -606,22 +659,33 @@ impl AuditLogger {
         }
     }
 
-    /// Asynchronously queue an audit record with awaitable backpressure.
-    pub async fn log_record(&self, mut record: AuditRecord) {
-        if let Some(ref tx) = self.tx {
-            record.arguments = redact_value(&record.arguments);
-            let _ = tx.send(AuditMessage::Record(Box::new(record))).await;
-        }
+    /// Asynchronously queue an audit record with awaitable backpressure and delivery confirmation.
+    pub async fn log_record(&self, mut record: AuditRecord) -> Result<(), String> {
+        let Some(ref tx) = self.tx else {
+            return Ok(());
+        };
+        record.arguments = redact_value(&record.arguments);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(AuditMessage::Record(Box::new(record), Some(ack_tx)))
+            .await
+            .map_err(|e| format!("Audit logger queue send failed: {e}"))?;
+        ack_rx
+            .await
+            .map_err(|_| "Audit logger actor dropped before acknowledging write".to_string())?
     }
 
     /// Wait for all previously queued audit records to be written and flushed to physical disk (`sync_data`).
-    pub async fn flush(&self) {
-        if let Some(ref tx) = self.tx {
-            let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
-            if tx.send(AuditMessage::Flush(ack_tx)).await.is_ok() {
-                let _ = ack_rx.await;
-            }
-        }
+    pub async fn flush(&self) -> Result<(), String> {
+        let Some(ref tx) = self.tx else {
+            return Ok(());
+        };
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
+        tx.send(AuditMessage::Flush(ack_tx))
+            .await
+            .map_err(|e| format!("Audit logger flush send failed: {e}"))?;
+        ack_rx
+            .await
+            .map_err(|_| "Audit logger actor dropped before flush completion".to_string())?
     }
 
     /// Direct async logging with immediate disk sync.
@@ -732,7 +796,7 @@ mod tests {
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
 
         let log_file = temp_dir.join("audit.jsonl");
-        let logger = AuditLogger::new(Some(log_file.clone()));
+        let logger = AuditLogger::new(Some(log_file.clone())).unwrap();
         assert!(logger.is_enabled());
 
         let record1 = AuditRecord::new(
@@ -754,7 +818,7 @@ mod tests {
         // Test asynchronous queue and flush
         logger.log_async(record1);
         logger.log_async(record2);
-        logger.flush().await;
+        let _ = logger.flush().await;
 
         // Read and verify JSONL lines
         let content = tokio::fs::read_to_string(&log_file).await.unwrap();
@@ -848,7 +912,7 @@ mod tests {
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
         let log_file = temp_dir.join("tamper_audit.jsonl");
 
-        let logger = AuditLogger::new(Some(log_file.clone()));
+        let logger = AuditLogger::new(Some(log_file.clone())).unwrap();
         for i in 1..=3 {
             logger.log_async(AuditRecord::new(
                 format!("tool_{i}"),
@@ -858,7 +922,7 @@ mod tests {
                 None,
             ));
         }
-        logger.flush().await;
+        let _ = logger.flush().await;
 
         // Verify clean chain
         let report = verify_audit_log_file(&log_file).await.unwrap();
@@ -914,18 +978,18 @@ mod tests {
 
         // 1. First run: write records 1 and 2
         {
-            let logger1 = AuditLogger::new(Some(log_file.clone()));
+            let logger1 = AuditLogger::new(Some(log_file.clone())).unwrap();
             logger1.log_async(AuditRecord::new("tool_1", json!({}), "success", 10, None));
             logger1.log_async(AuditRecord::new("tool_2", json!({}), "success", 20, None));
-            logger1.flush().await;
+            let _ = logger1.flush().await;
         }
 
         // 2. Restart: start new logger on same file
         {
-            let logger2 = AuditLogger::new(Some(log_file.clone()));
+            let logger2 = AuditLogger::new(Some(log_file.clone())).unwrap();
             logger2.log_async(AuditRecord::new("tool_3", json!({}), "success", 30, None));
             logger2.log_async(AuditRecord::new("tool_4", json!({}), "success", 40, None));
-            logger2.flush().await;
+            let _ = logger2.flush().await;
         }
 
         // 3. Verify entire 4-record chain is unbroken
@@ -951,14 +1015,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_audit_logger_disabled() {
-        let logger = AuditLogger::new(None);
+        let logger = AuditLogger::new(None).unwrap();
         assert!(!logger.is_enabled());
         assert!(logger.log_path().is_none());
 
         let record = AuditRecord::new("get_system_status", json!({}), "success", 10, None);
 
         logger.log_async(record.clone());
-        logger.flush().await;
+        let _ = logger.flush().await;
 
         assert!(logger.log(&record).await.is_ok());
     }
@@ -970,7 +1034,7 @@ mod tests {
         tokio::fs::create_dir_all(&temp_dir).await.unwrap();
         let log_file = temp_dir.join("durability_audit.jsonl");
 
-        let logger = AuditLogger::new(Some(log_file.clone()));
+        let logger = AuditLogger::new(Some(log_file.clone())).unwrap();
 
         // Queue 10 records rapidly
         for i in 1..=10 {
@@ -984,7 +1048,7 @@ mod tests {
         }
 
         // Flush ensures all 10 records are written and synced to disk
-        logger.flush().await;
+        let _ = logger.flush().await;
 
         let report = verify_audit_log_file(&log_file).await.unwrap();
         assert_eq!(report.total_records, 10);
@@ -999,6 +1063,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_audit_fail_closed_corrupted_log_startup() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("vibe_fail_closed_test_{}", std::process::id()));
+        let _ = tokio::fs::create_dir_all(&temp_dir).await;
+        let log_file = temp_dir.join("corrupted.jsonl");
+
+        // Write an invalid record with mismatched hash
+        let bad_record = r#"{"sequence":1,"timestamp":"2026-10-14T00:00:00Z","tool":"test","arguments":{},"status":"success","duration_ms":10,"previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","record_hash":"badhash"}"#;
+        tokio::fs::write(&log_file, format!("{bad_record}\n"))
+            .await
+            .unwrap();
+
+        let res = AuditLogger::new(Some(log_file.clone()));
+        assert!(
+            res.is_err(),
+            "Existing corrupted audit log must fail closed on startup"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
     async fn test_audit_bounded_channel_capacity() {
         let temp_dir =
             std::env::temp_dir().join(format!("vibe_bounded_test_{}", std::process::id()));
@@ -1006,7 +1092,7 @@ mod tests {
         let log_file = temp_dir.join("bounded_audit.jsonl");
 
         // Small capacity channel
-        let logger = AuditLogger::with_capacity(Some(log_file.clone()), 4);
+        let logger = AuditLogger::with_capacity(Some(log_file.clone()), 4).unwrap();
         for i in 1..=5 {
             logger.log_async(AuditRecord::new(
                 format!("tool_{i}"),
@@ -1017,7 +1103,7 @@ mod tests {
             ));
         }
 
-        logger.flush().await;
+        let _ = logger.flush().await;
 
         let report = verify_audit_log_file(&log_file).await.unwrap();
         assert!(report.total_records >= 4);

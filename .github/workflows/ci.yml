@@ -10,9 +10,13 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Build, Lint & Test
-    runs-on: ubuntu-latest
+  ci:
+    name: ${{ matrix.os }} - Test & Build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,7 +33,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Run static analysis (Clippy)
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
 
       - name: Run test suite
-        run: cargo test --all-targets
+        run: cargo test --all-targets --locked
+
+      - name: Build release binary
+        run: cargo build --release --locked

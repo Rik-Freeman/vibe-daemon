@@ -9,6 +9,8 @@ use tracing::debug;
 use crate::config::Config;
 use crate::mcp::protocol::{ResourceContents, ResourcePage};
 
+const RESOURCE_PAGE_SIZE: usize = 100;
+
 /// Error types returned by resource providers during listing or reading operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResourceError {
@@ -87,17 +89,34 @@ impl ResourceRegistry {
     pub async fn list(&self, cursor: Option<&str>) -> Result<ResourcePage, ResourceError> {
         let mut all_resources = Vec::new();
         for provider in &self.providers {
-            let page = provider.list(cursor).await?;
+            // Provider-local cursors cannot be safely shared across heterogeneous
+            // providers. Aggregate their bounded inventories, then paginate once.
+            let page = provider.list(None).await?;
             all_resources.extend(page.resources);
         }
+        all_resources.sort_by(|a, b| a.uri.cmp(&b.uri));
 
-        debug!(
-            count = all_resources.len(),
-            "Aggregated resource list returned"
-        );
+        let offset = match cursor {
+            Some(value) => usize::from_str_radix(value, 16).map_err(|_| {
+                ResourceError::InvalidUri("Invalid resources/list cursor".to_string())
+            })?,
+            None => 0,
+        };
+        if offset > all_resources.len() {
+            return Err(ResourceError::InvalidUri(
+                "resources/list cursor is outside the current resource set".to_string(),
+            ));
+        }
+        let end = offset
+            .saturating_add(RESOURCE_PAGE_SIZE)
+            .min(all_resources.len());
+        let next_cursor = (end < all_resources.len()).then(|| format!("{end:x}"));
+        let resources = all_resources[offset..end].to_vec();
+
+        debug!(count = resources.len(), "Aggregated resource list returned");
         Ok(ResourcePage {
-            resources: all_resources,
-            next_cursor: None,
+            resources,
+            next_cursor,
         })
     }
 

@@ -45,7 +45,8 @@ impl ToolContext {
     /// Helper constructor with default dependencies, useful for unit tests.
     pub fn default_test_context() -> Self {
         let config = Arc::new(Config::default());
-        let audit_logger = Arc::new(crate::audit::AuditLogger::new(None));
+        let audit_logger =
+            Arc::new(crate::audit::AuditLogger::new(None).expect("No path audit logger"));
         let rate_limiter = Arc::new(crate::rate_limiter::RateLimiter::from_config(
             &config.security,
         ));

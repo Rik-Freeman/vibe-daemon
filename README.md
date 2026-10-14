@@ -3,8 +3,8 @@
 [![Rust](https://img.shields.io/badge/rust-2024%20edition-orange.svg)](https://www.rust-lang.org/)
 [![MCP](https://img.shields.io/badge/MCP-2024--11--05-blue.svg)](https://modelcontextprotocol.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![CI](https://github.com/vibe-daemon/vibe-daemon/actions/workflows/ci.yml/badge.svg)](https://github.com/vibe-daemon/vibe-daemon/actions/workflows/ci.yml)
-[![Tests](https://img.shields.io/badge/tests-227%20passed-brightgreen.svg)]()
+[![CI](https://github.com/Rik-Freeman/vibe-daemon/actions/workflows/ci.yml/badge.svg)](https://github.com/Rik-Freeman/vibe-daemon/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-238%20passed-brightgreen.svg)]()
 [![Clippy](https://img.shields.io/badge/clippy-clean-brightgreen.svg)]()
 
 > **vibe-daemon** — высокопроизводительный, безопасный и расширяемый автономный демон на Rust для интеллектуального серверного администрирования через [Model Context Protocol (MCP)](https://modelcontextprotocol.io/).
@@ -157,19 +157,21 @@ flowchart TD
 
 ## 🔒 Безопасность и надежность
 
-### 1. Tamper-evident Audit Trail с защитой от утечек
+### 1. Fail-closed Tamper-evident Audit Trail
 Каждый вызов инструментов регистрируется в формате **JSON Lines (JSONL)** с криптографической цепочкой хэшей:
-* **Хэш-цепочка:** Каждая запись содержит `entry_id`, `prev_entry_hash` и собственный `entry_hash` (SHA-256 по всем каноническим полям). Невозможно удалить или изменить запись в прошлом без нарушения валидности всей цепочки.
+* **Хэш-цепочка:** Каждая запись содержит `entry_id` (sequence), `prev_entry_hash` и собственный `entry_hash` (SHA-256 по всем каноническим полям). Невозможно удалить или изменить запись в прошлом без нарушения валидности всей цепочки.
+* **Fail-closed валидация:** При обнаружении повреждения хэш-цепочки в существующем файле лога демон немедленно прерывает старт с фатальной ошибкой (fail-closed), исключая молчаливый сброс на genesis-хэш.
+* **Строгая фиксация и очередность:** Инкремент sequence и обновление хэша происходят строго после подтвержденной записи и flush на диск. Диспетчер MCP гарантирует подтверждение записи до отправки ответа клиенту.
 * **Автоматическое маскирование секретов (Redaction):** Модуль аудита автоматически распознает и скрывает:
   * Заголовки авторизации (`Bearer [REDACTED]`);
   * Приватные ключи RSA, ECDSA, OpenSSH (`[REDACTED_PRIVATE_KEY]`);
   * Пароли и токены в аргументах команд (`--password`, `-p`, `token=***`).
-* **Надежность (Durability):** Запись в файл производится через неблокирующего актера с периодическим вызовом `sync_data()`, гарантирующим сброс данных из дискового кэша ОС на физический накопитель.
+* **Надежность (Durability):** Запись производится через bounded actor; каждый подтверждённый обязательный audit-record проходит `write_all`, `flush` и `sync_data()` до ответа клиенту. Ошибка переводит actor в fail-closed состояние.
 
-### 2. Защита файловых операций и атомарность
+### 2. Защита файловых операций, атомарность и Canonical Containment
 * **Атомарная запись:** Данные сначала сохраняются во временный файл в том же каталоге (`.tmp.<filename>.<pid>`), после чего атомарно перемещаются (`rename`) на целевое место.
 * **Автоматические резервные копии:** Перед перезаписью любого файла создается копия с временной меткой `.bak.YYYYMMDD_HHMMSS`.
-* **Symlink / TOCTOU Guard:** Проверка канонических путей с использованием `symlink_metadata` предотвращает атаки через подмену симлинков на критические файлы системы.
+* **Canonical Containment:** Разрешение целевых путей в провайдере `config://` производится через `std::fs::canonicalize`. Строгая проверка вхождения в `allowed_config_dirs` на 100% блокирует любые попытки обхода каталогов через внешние симлинки.
 * **Filesystem Guard:** Категорический запрет на запись в `/etc/shadow`, `/etc/sudoers`, `/boot`, `/dev`, `/proc`, `/sys`.
 
 ### 3. Квоты фоновых задач (TaskManager)
@@ -188,7 +190,11 @@ flowchart TD
 2. **`http` (Streamable HTTP)**: Высокопроизводительный HTTP-сервер на базе `axum`. Эндпоинт `POST /mcp` принимает стандартные вызовы JSON-RPC 2.0.
 3. **`sse` (Server-Sent Events)**: Двунаправленный сетевой режим. Эндпоинт `GET /sse` открывает постоянный поток событий и уведомлений, а запросы отправляются на `POST /mcp`.
 
-### Bearer Token Авторизация
+### Безопасность сетевого транспорта (Loopback и Bearer Auth)
+Демон придерживается строгой модели защиты:
+* **Локальное подключение:** При привязке к loopback-интерфейсам (`127.0.0.1` или `[::1]`) демон доступен только локальным процессам хоста.
+* **Удаленное подключение (Fail-closed):** При попытке привязки к внешним интерфейсам (`0.0.0.0`, публичные IP) демон **требует обязательного наличия непустого токена** в конфигурации. Запуск с внешним bind без токена немедленно завершается с ошибкой `Remote HTTP/SSE bind requires an auth_token`.
+
 Для защиты сетевых интерфейсов в секции `[security]` настраивается секретный токен:
 ```toml
 [security]
@@ -207,10 +213,10 @@ Authorization: Bearer your-super-secret-token
 Демон реализует спецификацию **MCP Resources** (`resources/list`, `resources/read`, `resources/subscribe`, `resources/unsubscribe`):
 * **`system://`**:
   * `system://status` — мгновенный срез состояния системы (JSON);
-  * `system://ports` — активные сетевые порты;
-  * `system://services` — состояние отслеживаемых системных служб.
+  * `system://ports` — активные слушающие порты и установленные TCP-соединения;
+  * `system://services` — операционные статусы ключевых системных служб (`inspector.key_services`).
 * **`config://`**:
-  * Чтение конфигураций из белого списка каталогов (например, `config://nginx/nginx.conf`).
+  * Чтение конфигураций из белого списка каталогов (например, `config://nginx/nginx.conf`) с канонической защитой от симлинков (`canonicalize`).
 * **`log://`**:
   * Доступ к журналам сервисов из разрешенных каталогов (например, `log://nginx/access.log`).
 
@@ -220,10 +226,12 @@ Authorization: Bearer your-super-secret-token
 
 ## 📡 Шина асинхронных уведомлений (Server-Initiated Notifications)
 
-Демон оснащен шиной событий (`EventBus`), позволяющей отправлять асинхронные уведомления без `id`:
-* **`notifications/message`**: Системные предупреждения (например, превышение порога потребления памяти или аварийный перезапуск службы).
-* **`notifications/resources/updated`**: Уведомления об изменении отслеживаемого ресурса по URI.
-* **Завершение фоновых задач**: При завершении длительной задачи клиент получает событие с кодом возврата и затраченным временем без необходимости циклического опроса.
+Демон оснащен транспортно-нейтральной шиной событий (`EventBus`) с встроенными периодическими продюсерами (`producers`), отправляющими стандартные JSON-RPC 2.0 уведомления без `id`:
+* **`notifications/resources/updated`**: Уведомления об изменении отслеживаемого ресурса по URI (`ResourceUpdated`).
+* **`notifications/system/memory_threshold`**: Предупреждение о превышении порога RAM (`MemoryThresholdExceeded`).
+* **`notifications/services/down`**: Уведомление о падении ключевой службы (`ServiceDown`).
+* **`notifications/certificates/expiring`**: Предупреждение о приближении срока окончания SSL-сертификата (`CertificateExpiring`).
+* **Завершение фоновых задач (`notifications/tasks/completed`)**: При завершении длительной задачи клиент получает событие со статусом и taskId без необходимости циклического опроса.
 * **Доставка в Stdio**: Атомарный цикл `select!` предотвращает интерливинг строк между ответами на запросы и асинхронными нотификациями.
 * **Доставка в SSE**: Буферизованная неблокирующая передача подписчикам через `try_send` с защитой от зависания медленных клиентов.
 
@@ -293,15 +301,15 @@ termination_grace_secs = 3                 # Grace period завершения �
 
 ### Требования
 * **Rust:** версия 1.85+ (редакция 2024).
-* **ОС:** Linux (рекомендуется для продакшна), macOS, Windows.
+* **ОС:** Linux, macOS, Windows (развертывание на production Linux-хосте с физическим управлением Docker, systemd, Nginx и Certbot подлежит отдельной физической приемке).
 
 ### Сборка
 ```bash
-git clone https://github.com/your-username/vibe-daemon.git
+git clone https://github.com/Rik-Freeman/vibe-daemon.git
 cd vibe-daemon
 
 # Сборка релизной версии
-cargo build --release
+cargo build --release --locked
 ```
 
 Бинарный файл доступен в `target/release/vibe-daemon`.
@@ -326,12 +334,16 @@ Options:
 
 #### 1. Локальный Stdio (по умолчанию)
 ```bash
-vibe-daemon --config /etc/vibe-daemon/config.toml --audit-log /var/log/vibe-daemon/audit.jsonl
+vibe-daemon --config config.example.toml --audit-log audit.jsonl
 ```
 
 #### 2. Сетевой HTTP / SSE с Bearer авторизацией
 ```bash
-vibe-daemon --transport sse --host 0.0.0.0 --port 8900 --config config.toml
+# Локальный bind на loopback:
+vibe-daemon --transport sse --host 127.0.0.1 --port 8900 --config config.example.toml
+
+# Внешний bind (требует обязательный auth_token в config.toml):
+vibe-daemon --transport sse --host 0.0.0.0 --port 8900 --config config.example.toml
 ```
 
 ---
@@ -378,7 +390,7 @@ vibe-daemon --transport sse --host 0.0.0.0 --port 8900 --config config.toml
 
 ## 🧪 Тестирование и верификация
 
-Демон покрыт всесторонними модульными и интеграционными тестами (227 тестов):
+Демон покрыт всесторонними модульными и интеграционными тестами (238 тестов):
 * Модульные тесты Guard Engine, Rate Limiter, Tamper-evident Audit, File Ops, Task Manager, Resources, Event Bus.
 * Сквозные интеграционные тесты протокола MCP (Stdio handshake, tools/list, tools/call, resources/list, resources/subscribe, server notifications).
 
@@ -390,7 +402,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets -- -D warnings
 
 # Запуск полного набора тестов
-cargo test
+cargo test --all-targets --locked
 ```
 
 ---

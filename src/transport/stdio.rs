@@ -21,7 +21,9 @@ where
     W: AsyncWrite + Unpin,
 {
     let res = dispatcher.run(reader, writer).await;
-    dispatcher.audit_logger.flush().await;
+    if let Err(e) = dispatcher.audit_logger.flush().await {
+        tracing::warn!(error = %e, "Failed to flush audit logger after stdio stream shutdown");
+    }
     res
 }
 

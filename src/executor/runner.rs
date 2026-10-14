@@ -1,6 +1,7 @@
 //! Command execution runner with bounded memory, concurrency, and timeout handling.
 
 use crate::executor::logger::compress_output;
+#[cfg(unix)]
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -69,15 +70,44 @@ impl CommandOutcome {
 }
 
 #[derive(Default)]
+#[cfg(unix)]
 struct StreamBuffer {
     data: Vec<u8>,
     truncated: bool,
+}
+
+/// Execute Windows `taskkill` outside Tokio's process driver. A pathological
+/// `taskkill.exe` can outlive the deadline on its detached OS thread, but it
+/// cannot keep the async runtime or command request alive indefinitely.
+#[cfg(windows)]
+fn run_taskkill_bounded(pid: u32) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let result = std::process::Command::new("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let _ = tx.send(result);
+    });
+    let _ = rx.recv_timeout(Duration::from_millis(1500));
+}
+
+#[cfg(windows)]
+pub(crate) async fn terminate_windows_process_tree(pid: u32) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        run_taskkill_bounded(pid);
+        let _ = tx.send(());
+    });
+    let _ = tokio::time::timeout(Duration::from_millis(1700), rx).await;
 }
 
 /// Reads from an async stream concurrently into a memory-bounded accumulator.
 ///
 /// Excess bytes beyond `max_bytes` are drained and discarded to prevent the
 /// child process from blocking on full OS pipe buffers.
+#[cfg(unix)]
 async fn read_stream_bounded<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     max_bytes: usize,
@@ -109,14 +139,191 @@ async fn read_stream_bounded<R: tokio::io::AsyncRead + Unpin>(
     }
 }
 
+#[cfg(windows)]
+fn read_std_stream_bounded<R: std::io::Read>(mut reader: R, max_bytes: usize) -> (Vec<u8>, bool) {
+    let mut data = Vec::with_capacity(max_bytes.min(64 * 1024));
+    let mut truncated = false;
+    let mut buf = [0_u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                let available = max_bytes.saturating_sub(data.len());
+                let take = n.min(available);
+                data.extend_from_slice(&buf[..take]);
+                truncated |= take < n || available == 0;
+            }
+        }
+    }
+    (data, truncated)
+}
+
+#[cfg(windows)]
+struct WindowsJob(*mut std::ffi::c_void);
+
+#[cfg(windows)]
+impl WindowsJob {
+    fn assign(child: &std::process::Child) -> Option<Self> {
+        use std::os::windows::io::AsRawHandle;
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CreateJobObjectW(
+                job_attributes: *const std::ffi::c_void,
+                name: *const u16,
+            ) -> *mut std::ffi::c_void;
+            fn AssignProcessToJobObject(
+                job: *mut std::ffi::c_void,
+                process: *mut std::ffi::c_void,
+            ) -> i32;
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return None;
+        }
+        let assigned = unsafe { AssignProcessToJobObject(job, child.as_raw_handle().cast()) };
+        if assigned == 0 {
+            unsafe {
+                CloseHandle(job);
+            }
+            return None;
+        }
+        Some(Self(job))
+    }
+
+    fn terminate(&self) -> bool {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
+        }
+        unsafe { TerminateJobObject(self.0, 1) != 0 }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJob {
+    fn drop(&mut self) {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        }
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
+
+#[cfg(windows)]
+fn execute_process_bounded_windows_blocking(
+    process_cmd: &tokio::process::Command,
+    limits: &CommandLimits,
+) -> Result<CommandOutcome, String> {
+    let template = process_cmd.as_std();
+    let mut command = std::process::Command::new(template.get_program());
+    command.args(template.get_args());
+    if let Some(dir) = template.get_current_dir() {
+        command.current_dir(dir);
+    }
+    for (key, value) in template.get_envs() {
+        match value {
+            Some(value) => {
+                command.env(key, value);
+            }
+            None => {
+                command.env_remove(key);
+            }
+        }
+    }
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::piped());
+
+    let mut child = command
+        .spawn()
+        .map_err(|e| format!("Failed to spawn process: {e}"))?;
+    let job = WindowsJob::assign(&child);
+    let pid = child.id();
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| "Failed to capture process stdout".to_string())?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "Failed to capture process stderr".to_string())?;
+
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    let stdout_limit = limits.max_stdout_bytes;
+    std::thread::spawn(move || {
+        let _ = stdout_tx.send(read_std_stream_bounded(stdout, stdout_limit));
+    });
+    let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+    let stderr_limit = limits.max_stderr_bytes;
+    std::thread::spawn(move || {
+        let _ = stderr_tx.send(read_std_stream_bounded(stderr, stderr_limit));
+    });
+
+    let deadline = Instant::now() + limits.timeout;
+    let mut exit_code = None;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                exit_code = status.code();
+                break;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                timed_out = true;
+                if job.as_ref().is_none_or(|job| !job.terminate()) {
+                    run_taskkill_bounded(pid);
+                }
+                let _ = child.kill();
+                let reap_deadline =
+                    Instant::now() + limits.termination_grace.max(Duration::from_millis(500));
+                while Instant::now() < reap_deadline {
+                    if let Ok(Some(status)) = child.try_wait() {
+                        exit_code = status.code();
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                break;
+            }
+            Err(e) => return Err(format!("Process wait failed: {e}")),
+        }
+    }
+
+    let drain_timeout = limits.termination_grace.max(Duration::from_millis(500));
+    let (stdout, stdout_truncated) = stdout_rx
+        .recv_timeout(drain_timeout)
+        .unwrap_or_else(|_| (Vec::new(), true));
+    let (stderr, stderr_truncated) = stderr_rx
+        .recv_timeout(drain_timeout)
+        .unwrap_or_else(|_| (Vec::new(), true));
+
+    Ok(CommandOutcome {
+        exit_code,
+        stdout,
+        stderr,
+        stdout_truncated,
+        stderr_truncated,
+        timed_out,
+    })
+}
+
 /// Gracefully terminate and reap a child process, with fallback to forced tree kill.
 ///
 /// Guaranteed to invoke `child.wait()` to prevent zombie processes.
+#[cfg(unix)]
 async fn terminate_process(mut child: tokio::process::Child, grace: Duration) -> Option<i32> {
     let pid = child.id();
+    let reap_timeout = grace.max(Duration::from_millis(500));
 
     // On Unix: soft termination (SIGTERM) to process group (-pgid), wait grace, fallback to forced SIGKILL, then wait()
-    #[cfg(unix)]
     {
         if let Some(pid_val) = pid {
             let pgid = pid_val as libc::pid_t;
@@ -129,122 +336,133 @@ async fn terminate_process(mut child: tokio::process::Child, grace: Duration) ->
                     unsafe {
                         libc::kill(-pgid, libc::SIGKILL);
                     }
-                    let _ = child.kill().await;
-                    child.wait().await.ok().and_then(|s| s.code())
+                    let _ = child.start_kill();
+                    tokio::time::timeout(reap_timeout, child.wait())
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .and_then(|s| s.code())
                 }
             }
         } else {
-            let _ = child.kill().await;
-            child.wait().await.ok().and_then(|s| s.code())
+            let _ = child.start_kill();
+            tokio::time::timeout(reap_timeout, child.wait())
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|s| s.code())
         }
-    }
-
-    // On Windows: kill entire process tree (/T /F) to prevent orphaned subprocesses
-    #[cfg(windows)]
-    {
-        let _ = grace; // used on Unix for SIGTERM grace
-        if let Some(pid_val) = pid {
-            let mut kill_cmd = tokio::process::Command::new("taskkill");
-            kill_cmd.args(["/PID", &pid_val.to_string(), "/T", "/F"]);
-            kill_cmd.stdout(std::process::Stdio::null());
-            kill_cmd.stderr(std::process::Stdio::null());
-
-            // Await taskkill with a strict timeout to prevent blocking the async runtime
-            let _ = tokio::time::timeout(Duration::from_millis(1500), async {
-                if let Ok(mut kill_child) = kill_cmd.spawn() {
-                    let _ = kill_child.wait().await;
-                }
-            })
-            .await;
-        }
-        let _ = child.kill().await;
-        child.wait().await.ok().and_then(|s| s.code())
     }
 }
 
 /// Executes a `tokio::process::Command` under strict resource bounds:
 /// memory limits on stdout/stderr, async concurrent reading, and safe termination.
 pub async fn execute_process_bounded(
-    mut process_cmd: tokio::process::Command,
+    process_cmd: tokio::process::Command,
     limits: &CommandLimits,
 ) -> Result<CommandOutcome, String> {
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        process_cmd.process_group(0);
+        let owned_limits = limits.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = execute_process_bounded_windows_blocking(&process_cmd, &owned_limits);
+            let _ = tx.send(result);
+        });
+        rx.await
+            .map_err(|_| "Windows process worker terminated unexpectedly".to_string())?
     }
 
-    process_cmd.stdout(std::process::Stdio::piped());
-    process_cmd.stderr(std::process::Stdio::piped());
+    #[cfg(unix)]
+    {
+        let mut process_cmd = process_cmd;
+        process_cmd.process_group(0);
 
-    let mut child = process_cmd
-        .spawn()
-        .map_err(|e| format!("Failed to spawn process: {e}"))?;
+        process_cmd.stdout(std::process::Stdio::piped());
+        process_cmd.stderr(std::process::Stdio::piped());
 
-    let stdout_pipe = child.stdout.take();
-    let stderr_pipe = child.stderr.take();
+        let mut child = process_cmd
+            .spawn()
+            .map_err(|e| format!("Failed to spawn process: {e}"))?;
 
-    let stdout_acc = Arc::new(std::sync::Mutex::new(StreamBuffer::default()));
-    let stderr_acc = Arc::new(std::sync::Mutex::new(StreamBuffer::default()));
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
 
-    let stdout_task = if let Some(stdout) = stdout_pipe {
-        tokio::spawn(read_stream_bounded(
-            stdout,
-            limits.max_stdout_bytes,
-            stdout_acc.clone(),
-        ))
-    } else {
-        tokio::spawn(async {})
-    };
+        let stdout_acc = Arc::new(std::sync::Mutex::new(StreamBuffer::default()));
+        let stderr_acc = Arc::new(std::sync::Mutex::new(StreamBuffer::default()));
 
-    let stderr_task = if let Some(stderr) = stderr_pipe {
-        tokio::spawn(read_stream_bounded(
-            stderr,
-            limits.max_stderr_bytes,
-            stderr_acc.clone(),
-        ))
-    } else {
-        tokio::spawn(async {})
-    };
+        let mut stdout_task = if let Some(stdout) = stdout_pipe {
+            tokio::spawn(read_stream_bounded(
+                stdout,
+                limits.max_stdout_bytes,
+                stdout_acc.clone(),
+            ))
+        } else {
+            tokio::spawn(async {})
+        };
 
-    let (exit_code, timed_out) = tokio::select! {
-        status_res = child.wait() => {
-            match status_res {
-                Ok(status) => {
-                    let _ = tokio::time::timeout(limits.termination_grace, async {
-                        let _ = stdout_task.await;
-                        let _ = stderr_task.await;
-                    }).await;
-                    (status.code(), false)
+        let mut stderr_task = if let Some(stderr) = stderr_pipe {
+            tokio::spawn(read_stream_bounded(
+                stderr,
+                limits.max_stderr_bytes,
+                stderr_acc.clone(),
+            ))
+        } else {
+            tokio::spawn(async {})
+        };
+
+        let (exit_code, timed_out) = tokio::select! {
+            status_res = child.wait() => {
+                match status_res {
+                    Ok(status) => {
+                        let _ = tokio::time::timeout(limits.termination_grace, async {
+                            let _ = (&mut stdout_task).await;
+                            let _ = (&mut stderr_task).await;
+                        }).await;
+                        (status.code(), false)
+                    }
+                    Err(e) => return Err(format!("Process wait failed: {e}")),
                 }
-                Err(e) => return Err(format!("Process wait failed: {e}")),
             }
-        }
-        _ = tokio::time::sleep(limits.timeout) => {
-            stdout_task.abort();
-            stderr_task.abort();
-            let code = terminate_process(child, limits.termination_grace).await;
-            (code, true)
-        }
-    };
+            _ = tokio::time::sleep(limits.timeout) => {
+                let code = terminate_process(child, limits.termination_grace).await;
+                // Keep pipe readers alive while terminating the full process tree so
+                // Windows can deliver EOF and retire outstanding overlapped reads.
+                let drained = tokio::time::timeout(limits.termination_grace, async {
+                    let _ = (&mut stdout_task).await;
+                    let _ = (&mut stderr_task).await;
+                })
+                .await
+                .is_ok();
+                if !drained {
+                    stdout_task.abort();
+                    stderr_task.abort();
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                }
+                (code, true)
+            }
+        };
 
-    let (stdout, stdout_truncated) = {
-        let mut guard = stdout_acc.lock().map_err(|e| format!("Lock error: {e}"))?;
-        (std::mem::take(&mut guard.data), guard.truncated)
-    };
+        let (stdout, stdout_truncated) = {
+            let mut guard = stdout_acc.lock().map_err(|e| format!("Lock error: {e}"))?;
+            (std::mem::take(&mut guard.data), guard.truncated)
+        };
 
-    let (stderr, stderr_truncated) = {
-        let mut guard = stderr_acc.lock().map_err(|e| format!("Lock error: {e}"))?;
-        (std::mem::take(&mut guard.data), guard.truncated)
-    };
+        let (stderr, stderr_truncated) = {
+            let mut guard = stderr_acc.lock().map_err(|e| format!("Lock error: {e}"))?;
+            (std::mem::take(&mut guard.data), guard.truncated)
+        };
 
-    Ok(CommandOutcome {
-        exit_code,
-        stdout,
-        stderr,
-        stdout_truncated,
-        stderr_truncated,
-        timed_out,
-    })
+        Ok(CommandOutcome {
+            exit_code,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+            timed_out,
+        })
+    }
 }
 
 /// Executes a shell command string with bounded limits.

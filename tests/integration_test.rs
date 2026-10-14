@@ -3579,3 +3579,115 @@ async fn test_cli_server_initiated_notifications_stdio() {
 
     let _ = child.kill().await;
 }
+
+#[tokio::test]
+async fn test_cli_fail_closed_corrupt_audit_log() {
+    let bin_path = env!("CARGO_BIN_EXE_vibe-daemon");
+    let temp_dir =
+        std::env::temp_dir().join(format!("vibe_audit_fail_closed_{}", std::process::id()));
+    let _ = tokio::fs::create_dir_all(&temp_dir).await;
+    let corrupt_log = temp_dir.join("corrupted_audit.jsonl");
+
+    // Write a corrupted record whose record_hash does not match its contents
+    let corrupt_json = r#"{"seq":1,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","record_hash":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","timestamp":"2026-10-14T12:00:00Z","operation":"test_op","tool_name":"execute_safe_command","command":null,"user":"system","status":"success","details":{}}"#;
+    tokio::fs::write(&corrupt_log, format!("{corrupt_json}\n"))
+        .await
+        .unwrap();
+
+    let output = Command::new(bin_path)
+        .arg("--audit-log")
+        .arg(&corrupt_log)
+        .output()
+        .await
+        .expect("Failed to execute vibe-daemon");
+
+    assert!(
+        !output.status.success(),
+        "Daemon must fail startup when audit log is corrupt (fail-closed)"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Audit log integrity failure")
+            || stderr.contains("Integrity error")
+            || stderr.contains("corrupt"),
+        "Expected integrity error message in stderr, got: {stderr}"
+    );
+
+    let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+}
+
+#[tokio::test]
+async fn test_cli_system_ports_and_services_resources() {
+    let bin_path = env!("CARGO_BIN_EXE_vibe-daemon");
+
+    let mut child = Command::new(bin_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Failed to spawn vibe-daemon binary");
+
+    let mut stdin = child.stdin.take().expect("Failed to open stdin");
+    let stdout = child.stdout.take().expect("Failed to open stdout");
+    let mut stdout_reader = BufReader::new(stdout).lines();
+
+    // 1. Initialize
+    let init_req = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": { "name": "test-client", "version": "1.0.0" }
+        }
+    });
+    stdin
+        .write_all(format!("{init_req}\n").as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    let _ = stdout_reader.next_line().await.unwrap().unwrap();
+
+    // 2. Read system://ports
+    let read_ports_req = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "resources/read",
+        "params": { "uri": "system://ports" }
+    });
+    stdin
+        .write_all(format!("{read_ports_req}\n").as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    let resp_line = stdout_reader.next_line().await.unwrap().unwrap();
+    let resp_val: serde_json::Value = serde_json::from_str(&resp_line).unwrap();
+    assert_eq!(resp_val["id"], 2);
+    let ports_text = resp_val["result"]["contents"][0]["text"].as_str().unwrap();
+    assert!(ports_text.contains("listening_ports"));
+    assert!(ports_text.contains("established_connections"));
+
+    // 3. Read system://services
+    let read_services_req = json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "resources/read",
+        "params": { "uri": "system://services" }
+    });
+    stdin
+        .write_all(format!("{read_services_req}\n").as_bytes())
+        .await
+        .unwrap();
+    stdin.flush().await.unwrap();
+    let resp_services_line = stdout_reader.next_line().await.unwrap().unwrap();
+    let resp_services_val: serde_json::Value = serde_json::from_str(&resp_services_line).unwrap();
+    assert_eq!(resp_services_val["id"], 3);
+    let services_text = resp_services_val["result"]["contents"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(services_text.contains("key_services"));
+    assert!(services_text.contains("services"));
+
+    let _ = child.kill().await;
+}

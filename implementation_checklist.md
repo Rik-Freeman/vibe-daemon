@@ -10,7 +10,7 @@
 - [x] Добавить `toml` в `Cargo.toml` зависимости
 - [x] Создать `src/config.rs` — структуры конфигурации (`DaemonConfig`, `SecurityConfig`, `InspectorConfig`, `TasksConfig`, `AuditConfig`)
 - [x] Создать `config.example.toml` в корне проекта
-- [x] Добавить CLI-флаг `--config <path>` в [`main.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/main.rs)
+- [x] Добавить CLI-флаг `--config <path>` в [`main.rs`](src/main.rs)
 - [x] Рефакторинг `protected_ports`, `protected_services`, `allowed_config_dirs` — вынести из хардкода в конфиг
 - [x] Рефакторинг `command_timeout` (30s) — сделать настраиваемым
 - [x] Fallback на дефолтные значения если конфиг не указан
@@ -33,14 +33,14 @@
 - [x] Возвращать понятную ошибку при превышении лимита
 
 ### 1.4 Исправление технического долга
-- [x] [`mcp/mod.rs:14`](file:///c:/Users/User/Desktop/vibe-daemon/src/mcp/mod.rs#L14) — заменить `SERVER_VERSION` на `env!("CARGO_PKG_VERSION")`
-- [x] [`sys.rs:333`](file:///c:/Users/User/Desktop/vibe-daemon/src/inspector/sys.rs#L333) — расширить `default_allowed_dirs`: добавить `/etc/caddy`, `/etc/supervisor`, `/etc/haproxy`, `/etc/letsencrypt`
-- [x] [`firewall.rs:295`](file:///c:/Users/User/Desktop/vibe-daemon/src/guard/firewall.rs#L295) — fallback в `find_alternative_port` проверяет занятость портов
-- [x] [`sys.rs:374`](file:///c:/Users/User/Desktop/vibe-daemon/src/inspector/sys.rs#L374) — добавить лимит размера файла в `safe_read_config_file` (1 MB)
-- [x] [`firewall.rs:119`](file:///c:/Users/User/Desktop/vibe-daemon/src/guard/firewall.rs#L119) — сделать стриппинг `sudo`/`doas`/`nohup` рекурсивным (через `loop`)
-- [x] [`runner.rs:8`](file:///c:/Users/User/Desktop/vibe-daemon/src/executor/runner.rs#L8) — добавить лимит на размер stdout/stderr (предотвращение OOM)
-- [x] [`sys.rs:313`](file:///c:/Users/User/Desktop/vibe-daemon/src/inspector/sys.rs#L313) — сделать `key_services` настраиваемым через конфиг
-- [x] Добавить `pub mod config;` в [`lib.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/lib.rs)
+- [x] [`mcp/mod.rs:14`](src/mcp/mod.rs#L14) — заменить `SERVER_VERSION` на `env!("CARGO_PKG_VERSION")`
+- [x] [`sys.rs:333`](src/inspector/sys.rs#L333) — расширить `default_allowed_dirs`: добавить `/etc/caddy`, `/etc/supervisor`, `/etc/haproxy`, `/etc/letsencrypt`
+- [x] [`firewall.rs:295`](src/guard/firewall.rs#L295) — fallback в `find_alternative_port` проверяет занятость портов
+- [x] [`sys.rs:374`](src/inspector/sys.rs#L374) — добавить лимит размера файла в `safe_read_config_file` (1 MB)
+- [x] [`firewall.rs:119`](src/guard/firewall.rs#L119) — сделать стриппинг `sudo`/`doas`/`nohup` рекурсивным (через `loop`)
+- [x] [`runner.rs:8`](src/executor/runner.rs#L8) — добавить лимит на размер stdout/stderr (предотвращение OOM)
+- [x] [`sys.rs:313`](src/inspector/sys.rs#L313) — сделать `key_services` настраиваемым через конфиг
+- [x] Добавить `pub mod config;` в [`lib.rs`](src/lib.rs)
 
 ---
 
@@ -185,14 +185,14 @@
 - [x] **Этап 6: Журналы Journalctl и исключение Shell Injection** — временные диапазоны RFC 3339 (--since, --until), аудит всех внешних команд на `Command::args`.
 - [x] **Этап 7: Подсистема MCP Resources** — провайдеры `system://`, `config://`, `log://`, сессионный менеджер подписок, валидация путей.
 - [x] **Этап 8: Server-Initiated Notifications** — транспортно-нейтральная шина событий, нотификации для Stdio и SSE, защита от гонок и зависания клиентов.
-- [x] **Этап 9: Документация, Cleanup и Финальная полировка** — актуализация README.md, config.example.toml, синхронизация чеклиста, cargo fmt, clippy -D warnings, 227+ тестов.
+- [x] **Этап 9: Документация, Cleanup и Финальная полировка** — актуализация README.md, config.example.toml, синхронизация чеклиста, cargo fmt, clippy -D warnings, 238 тестов.
 
 ---
 
 ## 📌 Финальная приемка (Definition of Done)
 
 1. **Компиляция**: `cargo build --release` без warnings
-2. **Тесты**: `cargo test` — 227 тестов проходят со 100% успехом
+2. **Тесты**: `cargo test --all-targets --locked` — 238 тестов проходят со 100% успехом
 3. **Clippy**: `cargo clippy --all-targets -- -D warnings` — 0 предупреждений
 4. **Форматирование**: `cargo fmt --check` — чисто
 5. **Безопасность**: Guard Engine защищает порты, службы, ФС, исключает shell injection

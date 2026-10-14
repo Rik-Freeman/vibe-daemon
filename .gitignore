@@ -22,3 +22,10 @@ desktop.ini
 
 # Scratch and temporary directories
 scratch/
+/runtime-data/
+/.agents/
+
+# Environment files
+.env
+.env.*
+!.env.example

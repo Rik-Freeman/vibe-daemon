@@ -6,14 +6,14 @@
 
 | Компонент | Файл | Оценка | Комментарий |
 |---|---|---|---|
-| **MCP Protocol** | [`protocol.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/mcp/protocol.rs) | ⭐⭐⭐⭐ | Чистые JSON-RPC 2.0 типы, правильные error codes |
-| **MCP Dispatcher** | [`mcp/mod.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/mcp/mod.rs) | ⭐⭐⭐⭐ | Корректный stdio-цикл, маршрутизация всех 5 tools |
-| **Guard Engine** | [`firewall.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/guard/firewall.rs) | ⭐⭐⭐⭐⭐ | Отличная фильтрация: fork-bombs, rm -rf, SSH, dd, mkfs |
-| **Port Arbitration** | [`firewall.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/guard/firewall.rs#L257-L365) | ⭐⭐⭐⭐ | Умный поиск альтернативных портов |
-| **Inspector** | [`sys.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/inspector/sys.rs) | ⭐⭐⭐⭐ | Парсинг ss, /proc/meminfo, path traversal защита |
-| **Smart Logs** | [`logger.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/executor/logger.rs) | ⭐⭐⭐⭐⭐ | Дедупликация, сжатие успешного вывода, извлечение паник |
-| **Тесты** | [`integration_test.rs`](file:///c:/Users/User/Desktop/vibe-daemon/tests/integration_test.rs) | ⭐⭐⭐⭐⭐ | Полный stdio e2e тест, 46+ тестов |
-| **CLI** | [`main.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/main.rs) | ⭐⭐⭐⭐ | Чистый, clap-парсинг, tracing в stderr |
+| **MCP Protocol** | [`protocol.rs`](src/mcp/protocol.rs) | ⭐⭐⭐⭐ | Чистые JSON-RPC 2.0 типы, правильные error codes |
+| **MCP Dispatcher** | [`mcp/mod.rs`](src/mcp/mod.rs) | ⭐⭐⭐⭐ | Корректный stdio-цикл, маршрутизация всех 5 tools |
+| **Guard Engine** | [`firewall.rs`](src/guard/firewall.rs) | ⭐⭐⭐⭐⭐ | Отличная фильтрация: fork-bombs, rm -rf, SSH, dd, mkfs |
+| **Port Arbitration** | [`firewall.rs`](src/guard/firewall.rs) | ⭐⭐⭐⭐ | Умный поиск альтернативных портов |
+| **Inspector** | [`sys.rs`](src/inspector/sys.rs) | ⭐⭐⭐⭐ | Парсинг ss, /proc/meminfo, path traversal защита |
+| **Smart Logs** | [`logger.rs`](src/executor/logger.rs) | ⭐⭐⭐⭐⭐ | Дедупликация, сжатие успешного вывода, извлечение паник |
+| **Тесты** | [`integration_test.rs`](tests/integration_test.rs) | ⭐⭐⭐⭐⭐ | Полный stdio e2e тест, 46+ тестов |
+| **CLI** | [`main.rs`](src/main.rs) | ⭐⭐⭐⭐ | Чистый, clap-парсинг, tracing в stderr |
 
 > [!TIP]
 > **Общий вердикт**: Крепкий, хорошо спроектированный MVP. Архитектура модульная, Guard Engine реально работает, Smart Logs экономят токены, тесты покрывают все ключевые сценарии.
@@ -250,13 +250,13 @@ vibe_daemon_command_duration_seconds{tool="execute_safe_command"} 0.45
 
 | # | Проблема | Файл | Строка |
 |---|---|---|---|
-| 1 | `SERVER_VERSION` захардкожена как `"0.1.0"` вместо `env!("CARGO_PKG_VERSION")` | [`mcp/mod.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/mcp/mod.rs#L14) | 14 |
-| 2 | `default_allowed_dirs()` содержит только `/etc/nginx` — слишком узко | [`sys.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/inspector/sys.rs#L333-L346) | 333 |
-| 3 | `find_alternative_port` может вернуть уже занятый порт в fallback-ветке | [`firewall.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/guard/firewall.rs#L295-L299) | 295 |
-| 4 | Нет ограничения размера читаемого файла в `safe_read_config_file` | [`sys.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/inspector/sys.rs#L374-L442) | 374 |
-| 5 | `check_single_subcommand` стрипает `sudo` только один раз (не рекурсивно) | [`firewall.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/guard/firewall.rs#L119-L127) | 119 |
-| 6 | Нет лимита на размер stdout/stderr в `execute_command_with_smart_logs` | [`runner.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/executor/runner.rs#L8-L45) | 8 |
-| 7 | `key_services` в `collect_system_status` захардкожен на 3 сервиса | [`sys.rs`](file:///c:/Users/User/Desktop/vibe-daemon/src/inspector/sys.rs#L313) | 313 |
+| 1 | `SERVER_VERSION` захардкожена как `"0.1.0"` вместо `env!("CARGO_PKG_VERSION")` | [`mcp/mod.rs`](src/mcp/mod.rs#L14) | 14 |
+| 2 | `default_allowed_dirs()` содержит только `/etc/nginx` — слишком узко | [`sys.rs`](src/inspector/sys.rs#L333-L346) | 333 |
+| 3 | `find_alternative_port` может вернуть уже занятый порт в fallback-ветке | [`firewall.rs`](src/guard/firewall.rs#L295-L299) | 295 |
+| 4 | Нет ограничения размера читаемого файла в `safe_read_config_file` | [`sys.rs`](src/inspector/sys.rs#L374-L442) | 374 |
+| 5 | `check_single_subcommand` стрипает `sudo` только один раз (не рекурсивно) | [`firewall.rs`](src/guard/firewall.rs#L119-L127) | 119 |
+| 6 | Нет лимита на размер stdout/stderr в `execute_command_with_smart_logs` | [`runner.rs`](src/executor/runner.rs#L8-L45) | 8 |
+| 7 | `key_services` в `collect_system_status` захардкожен на 3 сервиса | [`sys.rs`](src/inspector/sys.rs#L313) | 313 |
 
 ---
 

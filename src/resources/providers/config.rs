@@ -52,16 +52,24 @@ impl ConfigResourceProvider {
             ));
         }
 
-        // Attempt matching against allowed directories
-        // Example: uri "config://nginx/nginx.conf" -> matches allowed directory ending in "nginx" with subpath "nginx.conf",
-        // or matches root of allowed directory if clean_relative starts with directory name.
+        // Attempt matching against allowed directories using canonical path resolution
         for allowed in allowed_dirs {
-            let normalized_allowed = match normalize_path(allowed) {
-                Ok(p) => p,
-                Err(_) => continue,
+            let canonical_allowed = if allowed.exists() {
+                match std::fs::canonicalize(allowed) {
+                    Ok(p) => p,
+                    Err(_) => match normalize_path(allowed) {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    },
+                }
+            } else {
+                match normalize_path(allowed) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                }
             };
 
-            let dir_name = normalized_allowed
+            let dir_name = canonical_allowed
                 .file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
@@ -72,23 +80,60 @@ impl ConfigResourceProvider {
                     sub
                 } else if clean_relative == dir_name {
                     ""
+                } else if clean_relative.contains('/') {
+                    // If uri explicitly addresses a different directory prefix, skip if this is not the matching dir
+                    if allowed_dirs.len() > 1 && !canonical_allowed.join(clean_relative).exists() {
+                        continue;
+                    }
+                    clean_relative
                 } else {
                     clean_relative
                 };
 
-            let candidate = normalized_allowed.join(target_subpath);
-            let normalized_candidate = match normalize_path(&candidate) {
-                Ok(p) => p,
-                Err(err) => {
+            let candidate = canonical_allowed.join(target_subpath);
+
+            // If the candidate file or symlink exists on the filesystem:
+            if candidate.exists() || candidate.symlink_metadata().is_ok() {
+                let canonical_candidate = match std::fs::canonicalize(&candidate) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        return Err(ResourceError::AccessDenied(format!(
+                            "Cannot resolve canonical path for '{}': {err}",
+                            candidate.display()
+                        )));
+                    }
+                };
+
+                // Enforce strict canonical prefix containment:
+                // Canonical target path MUST reside within the canonical allowed directory.
+                // This blocks symlinks targeting /etc/shadow, parent directories, or outside files.
+                if !canonical_candidate.starts_with(&canonical_allowed) {
                     return Err(ResourceError::AccessDenied(format!(
-                        "Path normalization error: {err}"
+                        "Access denied: resolved canonical path '{}' escapes authorized directory '{}'",
+                        canonical_candidate.display(),
+                        canonical_allowed.display()
                     )));
                 }
-            };
 
-            // Verify canonical prefix containment
-            if normalized_candidate.starts_with(&normalized_allowed) {
-                return Ok((normalized_allowed, normalized_candidate));
+                return Ok((canonical_allowed, canonical_candidate));
+            } else {
+                // If candidate does not exist on disk, enforce lexical containment
+                // so that read() can cleanly return ResourceError::NotFound.
+                let normalized_candidate = match normalize_path(&candidate) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        return Err(ResourceError::AccessDenied(format!(
+                            "Path normalization error: {err}"
+                        )));
+                    }
+                };
+
+                let normalized_allowed = normalize_path(&canonical_allowed)
+                    .unwrap_or_else(|_| canonical_allowed.clone());
+
+                if normalized_candidate.starts_with(&normalized_allowed) {
+                    return Ok((canonical_allowed, candidate));
+                }
             }
         }
 
@@ -255,6 +300,35 @@ mod tests {
         let err2 = provider.read(&not_found_uri).await.unwrap_err();
         assert!(matches!(err2, ResourceError::NotFound(_)));
 
+        // 5. Canonical symlink protection (symlink pointing outside allowed_dir must be rejected with AccessDenied)
+        let outside_dir = std::env::temp_dir().join("vibe_test_config_outside");
+        let _ = std::fs::create_dir_all(&outside_dir);
+        let secret_file = outside_dir.join("secret.conf");
+        std::fs::write(&secret_file, "SECRET_TOKEN=xyz").unwrap();
+
+        let symlink_in_allowed = temp_dir.join("symlink_escape.conf");
+        let _ = std::fs::remove_file(&symlink_in_allowed);
+
+        #[cfg(unix)]
+        let symlink_created = std::os::unix::fs::symlink(&secret_file, &symlink_in_allowed).is_ok();
+        #[cfg(windows)]
+        let symlink_created =
+            std::os::windows::fs::symlink_file(&secret_file, &symlink_in_allowed).is_ok();
+
+        if symlink_created {
+            let sym_uri = format!(
+                "config://{}/symlink_escape.conf",
+                temp_dir.file_name().unwrap().to_str().unwrap()
+            );
+            let err3 = provider.read(&sym_uri).await.unwrap_err();
+            assert!(
+                matches!(err3, ResourceError::AccessDenied(_)),
+                "Expected AccessDenied for symlink escaping allowed_config_dirs, got: {err3:?}"
+            );
+            let _ = std::fs::remove_file(&symlink_in_allowed);
+        }
+
+        let _ = std::fs::remove_dir_all(&outside_dir);
         let _ = std::fs::remove_dir_all(&temp_dir);
     }
 }

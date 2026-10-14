@@ -157,7 +157,9 @@ async fn collect_dir_entries(
     acc: &mut Vec<DirEntryInfo>,
 ) -> Result<(), String> {
     if acc.len() >= MAX_COLLECT_ENTRIES {
-        return Ok(());
+        return Err(format!(
+            "Directory scan exceeds safety limit of {MAX_COLLECT_ENTRIES} entries; narrow the path or depth"
+        ));
     }
 
     let mut read_dir = match tokio::fs::read_dir(dir).await {
@@ -170,7 +172,9 @@ async fn collect_dir_entries(
 
     while let Ok(Some(entry)) = read_dir.next_entry().await {
         if acc.len() >= MAX_COLLECT_ENTRIES {
-            break;
+            return Err(format!(
+                "Directory scan exceeds safety limit of {MAX_COLLECT_ENTRIES} entries; narrow the path or depth"
+            ));
         }
 
         let entry_path = entry.path();
@@ -318,6 +322,7 @@ pub async fn atomic_write_with_backup(
     }
 
     let mut backup_path_opt = None;
+    let mut existing_permissions = None;
     match tokio::fs::symlink_metadata(target_path).await {
         Ok(meta) => {
             if meta.file_type().is_symlink() {
@@ -332,6 +337,7 @@ pub async fn atomic_write_with_backup(
                     target_path.display()
                 ));
             }
+            existing_permissions = Some(meta.permissions());
             if create_backup {
                 let timestamp = Utc::now().format("%Y%m%d_%H%M%S").to_string();
                 let mut candidate_backup =
@@ -385,6 +391,12 @@ pub async fn atomic_write_with_backup(
             )
         })?;
 
+    if let Some(permissions) = existing_permissions {
+        tokio::fs::set_permissions(&temp_path, permissions)
+            .await
+            .map_err(|e| format!("Failed to preserve target permissions on temporary file: {e}"))?;
+    }
+
     use tokio::io::AsyncWriteExt;
     let write_res: Result<(), std::io::Error> = async {
         temp_file.write_all(content).await?;
@@ -437,6 +449,19 @@ pub async fn atomic_write_with_backup(
             temp_path.display(),
             target_path.display()
         ));
+    }
+
+    // Persist the directory entry update as well as the file contents. Directory
+    // fsync is required for rename durability on Unix filesystems.
+    #[cfg(unix)]
+    {
+        let parent_dir = tokio::fs::File::open(parent)
+            .await
+            .map_err(|e| format!("Failed to open parent directory for sync: {e}"))?;
+        parent_dir
+            .sync_all()
+            .await
+            .map_err(|e| format!("Failed to sync parent directory after atomic rename: {e}"))?;
     }
 
     Ok(AtomicWriteResult {

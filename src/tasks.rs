@@ -131,13 +131,15 @@ async fn kill_process_tree(
                     unsafe {
                         libc::kill(-pgid, libc::SIGKILL);
                     }
-                    let _ = child.kill().await;
-                    let _ = child.wait().await;
+                    let _ = child.start_kill();
+                    let _ =
+                        tokio::time::timeout(grace.max(Duration::from_millis(500)), child.wait())
+                            .await;
                 }
             }
         } else {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            let _ = child.start_kill();
+            let _ = tokio::time::timeout(grace.max(Duration::from_millis(500)), child.wait()).await;
         }
     }
 
@@ -146,21 +148,10 @@ async fn kill_process_tree(
         let _ = grace;
         if let Some(pid) = pid_opt {
             // taskkill /PID <pid> /T /F terminates process and all its child processes
-            let mut kill_cmd = tokio::process::Command::new("taskkill");
-            kill_cmd.args(["/PID", &pid.to_string(), "/T", "/F"]);
-            kill_cmd.stdout(std::process::Stdio::null());
-            kill_cmd.stderr(std::process::Stdio::null());
-
-            // Await taskkill with a strict timeout to prevent blocking the async runtime
-            let _ = tokio::time::timeout(Duration::from_millis(1500), async {
-                if let Ok(mut kill_child) = kill_cmd.spawn() {
-                    let _ = kill_child.wait().await;
-                }
-            })
-            .await;
+            crate::executor::runner::terminate_windows_process_tree(pid).await;
         }
-        let _ = child.kill().await;
-        let _ = child.wait().await;
+        let _ = child.start_kill();
+        let _ = tokio::time::timeout(grace.max(Duration::from_millis(500)), child.wait()).await;
     }
 }
 

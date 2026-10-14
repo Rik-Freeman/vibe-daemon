@@ -25,7 +25,6 @@ pub struct McpDispatcher {
     pub resource_registry: std::sync::Arc<crate::resources::ResourceRegistry>,
     pub subscription_manager: std::sync::Arc<crate::resources::SubscriptionManager>,
     pub event_bus: std::sync::Arc<crate::events::EventBus>,
-    pub connected_client: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl Default for McpDispatcher {
@@ -39,8 +38,10 @@ impl McpDispatcher {
         Self::with_config(crate::config::Config::default())
     }
 
-    /// Construct a dispatcher with a given Config.
-    pub fn with_config(config: crate::config::Config) -> Self {
+    /// Attempt to construct a dispatcher with a given Config, failing closed if audit log integrity fails.
+    pub fn try_with_config(
+        config: crate::config::Config,
+    ) -> Result<Self, crate::audit::AuditIntegrityError> {
         let audit_path = config.audit_log_path().map(|p| p.to_path_buf());
         let rate_limiter = crate::rate_limiter::RateLimiter::from_config(&config.security);
         let event_bus = std::sync::Arc::new(crate::events::EventBus::default());
@@ -51,17 +52,24 @@ impl McpDispatcher {
         let resource_registry =
             crate::resources::ResourceRegistry::default_registry(cfg_arc.clone());
         let subscription_manager = crate::resources::SubscriptionManager::new();
-        Self {
+        let audit_logger = crate::audit::AuditLogger::new(audit_path)?;
+
+        Ok(Self {
             config: cfg_arc,
-            audit_logger: std::sync::Arc::new(crate::audit::AuditLogger::new(audit_path)),
+            audit_logger: std::sync::Arc::new(audit_logger),
             rate_limiter: std::sync::Arc::new(rate_limiter),
             task_manager: std::sync::Arc::new(task_manager),
             tool_registry: std::sync::Arc::new(crate::tools::ToolRegistry::default_registry()),
             resource_registry: std::sync::Arc::new(resource_registry),
             subscription_manager: std::sync::Arc::new(subscription_manager),
             event_bus,
-            connected_client: std::sync::Arc::new(std::sync::RwLock::new(None)),
-        }
+        })
+    }
+
+    /// Construct a dispatcher with a given Config (panics if audit log verification fails: fail-closed).
+    pub fn with_config(config: crate::config::Config) -> Self {
+        Self::try_with_config(config)
+            .expect("Audit log failed integrity verification on startup (fail-closed)")
     }
 
     /// Construct a dispatcher with a specific custom AuditLogger.
@@ -137,6 +145,16 @@ impl McpDispatcher {
         line: &str,
         session_id: Option<&str>,
     ) -> Option<String> {
+        self.handle_line_with_context(line, session_id, None).await
+    }
+
+    /// Process a JSON-RPC line with request-scoped session and client identity.
+    pub async fn handle_line_with_context(
+        &self,
+        line: &str,
+        session_id: Option<&str>,
+        client_identity: Option<&str>,
+    ) -> Option<String> {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             return None;
@@ -162,7 +180,9 @@ impl McpDispatcher {
             return serde_json::to_string(&error_resp).ok();
         }
 
-        let response = self.handle_request_with_session(request, session_id).await;
+        let response = self
+            .handle_request_with_context(request, session_id, client_identity)
+            .await;
         response.and_then(|resp| match serde_json::to_string(&resp) {
             Ok(serialized) => Some(serialized),
             Err(err) => {
@@ -183,6 +203,17 @@ impl McpDispatcher {
         request: JsonRpcRequest,
         session_id: Option<&str>,
     ) -> Option<JsonRpcResponse> {
+        self.handle_request_with_context(request, session_id, None)
+            .await
+    }
+
+    /// Dispatch a request with transport-provided, request-scoped identity.
+    pub async fn handle_request_with_context(
+        &self,
+        request: JsonRpcRequest,
+        session_id: Option<&str>,
+        client_identity: Option<&str>,
+    ) -> Option<JsonRpcResponse> {
         let method = request.method.as_str();
         debug!(method = %method, id = ?request.id, session = ?session_id, "Handling incoming MCP request");
 
@@ -192,7 +223,7 @@ impl McpDispatcher {
                 self.handle_initialized_notification(request)
             }
             "tools/list" => Some(self.handle_tools_list(request)),
-            "tools/call" => Some(self.handle_tools_call(request).await),
+            "tools/call" => Some(self.handle_tools_call(request, client_identity).await),
             "resources/list" => Some(self.handle_resources_list(request).await),
             "resources/read" => Some(self.handle_resources_read(request).await),
             "resources/subscribe" => {
@@ -227,15 +258,6 @@ impl McpDispatcher {
         info!("Processing MCP initialize request");
 
         let protocol_version = if let Some(ref params) = request.params {
-            if let Some(client_info) = params.get("clientInfo") {
-                let name = client_info.get("name").and_then(|n| n.as_str());
-                if let Some(n) = name
-                    && let Ok(mut lock) = self.connected_client.write()
-                {
-                    *lock = Some(n.to_string());
-                }
-            }
-
             params
                 .get("protocolVersion")
                 .and_then(|v| v.as_str())
@@ -311,7 +333,11 @@ impl McpDispatcher {
     }
 
     /// Handle the `tools/call` method.
-    async fn handle_tools_call(&self, request: JsonRpcRequest) -> JsonRpcResponse {
+    async fn handle_tools_call(
+        &self,
+        request: JsonRpcRequest,
+        client_identity: Option<&str>,
+    ) -> JsonRpcResponse {
         info!("Processing MCP tools/call request");
 
         let Some(params_value) = request.params else {
@@ -347,7 +373,7 @@ impl McpDispatcher {
             warn!(tool = %tool_name, error = %rate_err, "Tool call rejected due to rate limiting");
             CallToolResult::error(rate_err.to_string())
         } else if let Some(tool) = self.tool_registry.get(tool_name) {
-            let client = self.connected_client.read().ok().and_then(|c| c.clone());
+            let client = client_identity.map(str::to_owned);
             let ctx = crate::tools::ToolContext::new(
                 self.config.clone(),
                 self.audit_logger.clone(),
@@ -373,7 +399,7 @@ impl McpDispatcher {
         } else {
             ("success", None)
         };
-        let client = self.connected_client.read().ok().and_then(|c| c.clone());
+        let client = client_identity.map(str::to_owned);
 
         let mut audit_record = crate::audit::AuditRecord::new(
             tool_name_owned,
@@ -385,7 +411,16 @@ impl McpDispatcher {
         if let Some(err) = err_msg {
             audit_record = audit_record.with_error(err);
         }
-        self.audit_logger.log_async(audit_record);
+        if let Err(e) = self.audit_logger.log_record(audit_record).await {
+            error!(error = %e, "Failed to persist audit trail entry");
+            return JsonRpcResponse::error(
+                request.id,
+                protocol::INTERNAL_ERROR,
+                format!(
+                    "Tool result withheld because the mandatory audit record could not be durably persisted: {e}"
+                ),
+            );
+        }
 
         let result_value = match serde_json::to_value(tool_result) {
             Ok(v) => v,
@@ -550,13 +585,31 @@ impl McpDispatcher {
     {
         let mut lines = BufReader::new(reader).lines();
         let mut event_rx = self.event_bus.subscribe();
+        let mut client_identity: Option<String> = None;
 
         loop {
             tokio::select! {
                 line_res = lines.next_line() => {
                     match line_res? {
                         Some(line) => {
-                            if let Some(response_str) = self.handle_line_with_session(&line, Some("stdio")).await {
+                            if let Ok(value) = serde_json::from_str::<serde_json::Value>(&line)
+                                && value.get("method").and_then(|v| v.as_str()) == Some("initialize")
+                                && let Some(name) = value
+                                    .get("params")
+                                    .and_then(|v| v.get("clientInfo"))
+                                    .and_then(|v| v.get("name"))
+                                    .and_then(|v| v.as_str())
+                            {
+                                client_identity = Some(name.to_string());
+                            }
+                            if let Some(response_str) = self
+                                .handle_line_with_context(
+                                    &line,
+                                    Some("stdio"),
+                                    client_identity.as_deref().or(Some("stdio")),
+                                )
+                                .await
+                            {
                                 writer.write_all(response_str.as_bytes()).await?;
                                 writer.write_all(b"\n").await?;
                                 writer.flush().await?;
@@ -594,7 +647,9 @@ impl McpDispatcher {
         self.subscription_manager.cleanup_session("stdio").await;
 
         // Flush any remaining audit log records before exiting
-        self.audit_logger.flush().await;
+        if let Err(e) = self.audit_logger.flush().await {
+            tracing::warn!(error = %e, "Failed to flush audit logger before exit");
+        }
         Ok(())
     }
 }
@@ -634,6 +689,46 @@ mod tests {
         assert_eq!(resp["result"]["serverInfo"]["version"], "0.1.0");
         assert_eq!(resp["result"]["protocolVersion"], "2024-11-05");
         assert!(resp["result"]["capabilities"]["tools"].is_object());
+    }
+
+    #[tokio::test]
+    async fn test_tool_result_is_withheld_when_mandatory_audit_fails() {
+        let temp_root = std::env::temp_dir().join(format!(
+            "vibe_audit_runtime_failure_{}_{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let audit_path = temp_root.join("audit.jsonl");
+        let logger = crate::audit::AuditLogger::new(Some(audit_path.clone())).unwrap();
+        // Make the lazily-opened audit target unwritable as a regular file.
+        std::fs::create_dir_all(&audit_path).unwrap();
+        let dispatcher = McpDispatcher::new().with_audit_logger(logger);
+        let raw = json!({
+            "jsonrpc": "2.0",
+            "id": 77,
+            "method": "tools/call",
+            "params": {
+                "name": "get_system_status",
+                "arguments": {}
+            }
+        })
+        .to_string();
+
+        let response = dispatcher
+            .handle_line_with_context(&raw, Some("audit-test"), Some("client-a"))
+            .await
+            .expect("error response expected");
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["error"]["code"], protocol::INTERNAL_ERROR);
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("mandatory audit record")
+        );
+
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 
     #[tokio::test]

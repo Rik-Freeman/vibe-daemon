@@ -100,21 +100,33 @@ async fn main() -> anyhow::Result<()> {
         "Starting vibe-daemon MCP server"
     );
 
-    let dispatcher = McpDispatcher::with_config(config);
+    let dispatcher = McpDispatcher::try_with_config(config).map_err(|err| {
+        eprintln!("CRITICAL: Audit log integrity failure (fail-closed): {err}");
+        anyhow::anyhow!("Audit log integrity verification failed: {err}")
+    })?;
     let audit_logger = dispatcher.audit_logger.clone();
+    let event_producer = vibe_daemon::events::spawn_system_event_producer(
+        dispatcher.config.clone(),
+        dispatcher.event_bus.clone(),
+        vibe_daemon::events::SystemEventCheckOptions::default(),
+        std::time::Duration::from_secs(30),
+    );
 
-    match transport_type {
+    let transport_result = match transport_type {
         vibe_daemon::transport::TransportType::Stdio => {
-            vibe_daemon::transport::run_stdio(dispatcher).await?;
+            vibe_daemon::transport::run_stdio(dispatcher).await
         }
         vibe_daemon::transport::TransportType::Http
         | vibe_daemon::transport::TransportType::Sse => {
-            vibe_daemon::transport::run_http(dispatcher, &cli.host, cli.port, transport_type)
-                .await?;
+            vibe_daemon::transport::run_http(dispatcher, &cli.host, cli.port, transport_type).await
         }
-    }
+    };
 
-    audit_logger.flush().await;
+    event_producer.abort();
+    let _ = event_producer.await;
+
+    audit_logger.flush().await.map_err(anyhow::Error::msg)?;
+    transport_result?;
     info!("vibe-daemon stopped cleanly");
     Ok(())
 }
