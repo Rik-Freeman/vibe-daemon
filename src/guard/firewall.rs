@@ -775,7 +775,11 @@ pub async fn manage_system_service_with_config(
         Ok(output) => Ok(output),
         Err(err) => {
             let err_lower = err.to_lowercase();
-            if err_lower.contains("not recognized")
+            if action_lower == "status" {
+                // For status queries, systemctl returns non-zero LSB exit codes (e.g. 3 for inactive/dead, 4 for unit not found).
+                // This is valid diagnostic status information.
+                Ok(format!("Service '{service_name}' status: {}", err.trim()))
+            } else if err_lower.contains("not recognized")
                 || err_lower.contains("not found")
                 || err_lower.contains("failed to spawn")
                 || err_lower.contains("system has not been booted")
