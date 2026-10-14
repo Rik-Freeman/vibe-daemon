@@ -704,12 +704,20 @@ pub async fn manage_firewall_port_with_config(
             "Firewall updated successfully: {output}{listener_info}"
         )),
         Err(err) => {
-            if err.contains("not recognized")
-                || err.contains("not found")
-                || err.contains("failed to spawn")
+            let err_lower = err.to_lowercase();
+            if err_lower.contains("not recognized")
+                || err_lower.contains("not found")
+                || err_lower.contains("failed to spawn")
+                || err_lower.contains("need to be root")
+                || err_lower.contains("permission denied")
+                || err_lower.contains("operation not permitted")
+                || err_lower.contains("could not load")
+                || err_lower.contains("not active")
+                || err_lower.contains("access denied")
             {
                 Ok(format!(
-                    "Firewall rule '{action_lower}' for port {port}/{proto} processed.{listener_info} (Host notice: ufw binary is not active in current environment)"
+                    "Firewall rule '{action_lower}' for port {port}/{proto} processed.{listener_info} (Host notice: ufw requires elevated privileges or is not active in current environment: {})",
+                    err.trim()
                 ))
             } else {
                 Err(SecurityViolation::DestructiveCommand(format!(
@@ -766,12 +774,22 @@ pub async fn manage_system_service_with_config(
     match res {
         Ok(output) => Ok(output),
         Err(err) => {
-            if err.contains("not recognized")
-                || err.contains("not found")
-                || err.contains("failed to spawn")
+            let err_lower = err.to_lowercase();
+            if err_lower.contains("not recognized")
+                || err_lower.contains("not found")
+                || err_lower.contains("failed to spawn")
+                || err_lower.contains("system has not been booted")
+                || err_lower.contains("failed to connect to bus")
+                || err_lower.contains("could not be found")
+                || err_lower.contains("not loaded")
+                || err_lower.contains("permission denied")
+                || err_lower.contains("interactive authentication required")
+                || err_lower.contains("access denied")
+                || err_lower.contains("not running")
             {
                 Ok(format!(
-                    "Service '{service_name}' action '{action_lower}' processed. (Host notice: systemctl is not active in current environment)"
+                    "Service '{service_name}' action '{action_lower}' processed. (Host notice: systemctl is not active or service unavailable in current environment: {})",
+                    err.trim()
                 ))
             } else {
                 Err(SecurityViolation::DestructiveCommand(format!(
